@@ -252,7 +252,8 @@ $('#referenceImages').addEventListener('change', (event) => {
 
 $('#singleForm').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const button = event.submitter;
+  const form = event.currentTarget;
+  const button = event.submitter || form.querySelector('button[type="submit"]');
   button.disabled = true;
   button.textContent = '正在上传…';
   try {
@@ -265,11 +266,11 @@ $('#singleForm').addEventListener('submit', async (event) => {
     if (invalidIndex >= 0) {
       throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；H3 视频复刻只支持 4–15 秒`);
     }
-    const body = new FormData(event.currentTarget);
+    const body = new FormData(form);
     if (!body.get('seed')) body.delete('seed');
     body.append('video_durations', JSON.stringify(durations));
     const data = await api('/api/tasks', { method: 'POST', body });
-    event.currentTarget.reset();
+    form.reset();
     state.selectedVideos = [];
     state.selectedImages = [];
     clearMediaPreview($('#videoPreview'));
@@ -286,12 +287,13 @@ $('#singleForm').addEventListener('submit', async (event) => {
 
 $('#excelForm').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const button = event.submitter;
+  const form = event.currentTarget;
+  const button = event.submitter || form.querySelector('button[type="submit"]');
   button.disabled = true;
   button.textContent = '正在导入…';
   const result = $('#importResult');
   try {
-    const body = new FormData(event.currentTarget);
+    const body = new FormData(form);
     const data = await api('/api/tasks/import', { method: 'POST', body });
     result.classList.remove('hidden');
     const details = data.errors.length

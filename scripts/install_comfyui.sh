@@ -12,6 +12,8 @@ fi
 
 COMFY_DIR="${H3_COMFYUI_DIR:-/root/autodl-tmp/ComfyUI}"
 BASE_PYTHON="${H3_BASE_PYTHON:-python3}"
+export UV_CACHE_DIR="${H3_UV_CACHE_DIR:-/root/autodl-tmp/.cache/uv}"
+mkdir -p "$UV_CACHE_DIR"
 
 if ! command -v git >/dev/null 2>&1; then
   echo "正在安装 git..."
@@ -30,8 +32,11 @@ import sys
 
 try:
     import torch
-except ImportError as exc:
-    raise SystemExit("基础镜像没有安装 PyTorch，请重新选择 AutoDL 的 PyTorch 基础镜像。") from exc
+    import torchvision
+except Exception as exc:
+    raise SystemExit(
+        "基础镜像没有完整安装 PyTorch 和 torchvision，请重新选择 AutoDL 的 PyTorch 基础镜像。"
+    ) from exc
 
 parts = torch.__version__.split("+", 1)[0].split(".")
 version = tuple(int("".join(ch for ch in part if ch.isdigit()) or 0) for part in parts[:2])
@@ -47,6 +52,7 @@ if torch.version.cuda is None:
 
 print(f"Python: {sys.version.split()[0]}")
 print(f"PyTorch: {torch.__version__}")
+print(f"torchvision: {torchvision.__version__}")
 print(f"PyTorch CUDA 构建: {torch.version.cuda}")
 if torch.cuda.is_available():
     print(f"当前 GPU: {torch.cuda.get_device_name(0)}")
@@ -72,9 +78,29 @@ fi
 
 COMFY_PYTHON="$COMFY_DIR/.venv/bin/python"
 "$COMFY_PYTHON" -m pip install --upgrade pip uv
+FAST_REQUIREMENTS="$COMFY_DIR/.requirements-without-base-torch.txt"
+"$BASE_PYTHON" - "$COMFY_DIR/requirements.txt" "$FAST_REQUIREMENTS" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+skipped = {"torch", "torchvision", "torchaudio"}
+lines = []
+for line in source.read_text().splitlines():
+    requirement = line.split("#", 1)[0].strip()
+    match = re.match(r"^([A-Za-z0-9_.-]+)", requirement)
+    if match and match.group(1).lower().replace("_", "-") in skipped:
+        continue
+    lines.append(line)
+destination.write_text("\n".join(lines) + "\n")
+PY
+
+echo "正在快速安装 ComfyUI 依赖；复用基础镜像的 torch/torchvision，不重复下载 CUDA 大包。"
 "$COMFY_DIR/.venv/bin/uv" pip install \
   --python "$COMFY_PYTHON" \
-  -r "$COMFY_DIR/requirements.txt"
+  -r "$FAST_REQUIREMENTS"
 
 "$COMFY_PYTHON" - <<'PY'
 import torch

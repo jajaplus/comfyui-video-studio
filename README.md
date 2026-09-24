@@ -1,6 +1,104 @@
 # MiniMax H3 视频替换工作台
 
-这是一个部署在 AutoDL 基础 PyTorch 镜像上的 MiniMax-H3 Ref2VA 客户端。可以先使用 AutoDL 无 GPU 模式上传项目、安装全部依赖并挂载公共模型，完成后再切换到 GPU 模式运行。安装脚本会在数据盘安装 ComfyUI，浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序提交给本机 ComfyUI。网页不设置登录或访问令牌，访问地址后即可使用。
+这是一个部署在 AutoDL 上的 MiniMax-H3 Ref2VA 客户端。推荐直接使用已经包含 `/root/ComfyUI` 的应用镜像；基础 PyTorch 镜像也可以按照后面的章节手动安装。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序提交给本机 ComfyUI。网页不设置登录或访问令牌，访问地址后即可使用。
+
+## AutoDL 已有 ComfyUI 镜像快速部署
+
+如果服务器根目录已经存在 `/root/ComfyUI` 和 `/root/start.sh`，使用本节即可，不要再运行 `scripts/install_autodl.sh`。后面的“基础镜像安装 ComfyUI”章节只用于没有 `/root/ComfyUI` 的服务器。
+
+### 1. 上传并解压项目
+
+在 Mac 上传已经生成的压缩包：
+
+```bash
+scp -P 你的SSH端口 \
+  /Users/linyongjia/Desktop/comfyui-video-studio.tar.gz \
+  root@你的AutoDL主机:/root/autodl-tmp/
+```
+
+在 AutoDL 终端解压：
+
+```bash
+cd /root/autodl-tmp
+tar -xzf comfyui-video-studio.tar.gz
+cd /root/autodl-tmp/comfyui-video-studio
+chmod +x scripts/*.sh
+```
+
+### 2. 使用镜像自带的 ComfyUI
+
+复制应用镜像专用配置，然后只安装客户端依赖：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+cp .env.autodl-comfyui.example .env
+scripts/install_client_only.sh
+```
+
+该脚本不会安装或复制 ComfyUI，只会复用 `/root/ComfyUI`，因此安装很快。
+
+检查镜像是否已经包含 MiniMax-H3 原生节点：
+
+```bash
+grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
+  'MiniMaxH3ReferenceToVideo' \
+  /root/ComfyUI/comfy /root/ComfyUI/comfy_extras \
+  && echo 'MiniMax-H3 节点正常' \
+  || echo '需要更新 ComfyUI'
+```
+
+如果显示“需要更新 ComfyUI”，执行：
+
+```bash
+cd /root/ComfyUI
+git pull --ff-only
+
+if [ -x /root/miniconda3/envs/comfyui/bin/python ]; then
+  COMFY_PYTHON=/root/miniconda3/envs/comfyui/bin/python
+else
+  COMFY_PYTHON=python3
+fi
+
+"$COMFY_PYTHON" -m pip install -r requirements.txt
+```
+
+### 3. 挂载四个公共模型
+
+先确认第三个哈希路径确实存在：
+
+```bash
+ls -lh '/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d'
+```
+
+然后执行：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+
+scripts/link_autodl_models.sh \
+  '/.autodl/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors' \
+  '/.autodl/Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors' \
+  '/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d' \
+  '/.autodl/Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors'
+```
+
+### 4. 启动
+
+不要运行镜像根目录的 `/root/start.sh`；本项目会把 ComfyUI 启动在 6008，把客户端启动在 6006：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+scripts/start_all.sh
+```
+
+检查两个服务：
+
+```bash
+curl --max-time 5 http://127.0.0.1:6008/system_stats
+curl --max-time 5 http://127.0.0.1:6006/health
+```
+
+第二个命令返回 `"engine":"ok"` 后，在 AutoDL 控制台创建 6006 端口的自定义服务并打开。需要查看 ComfyUI 节点页面时，再创建 6008 端口的自定义服务。
 
 ## 功能
 
@@ -156,6 +254,8 @@ scripts/install_autodl.sh
 
 ComfyUI 和任务数据都位于 `/root/autodl-tmp` 数据盘。实例释放前只要保留数据盘，环境、任务数据库和生成结果就不会随系统盘消失。
 
+安装脚本使用快速模式：ComfyUI 虚拟环境直接复用基础镜像中的 `torch` 和 `torchvision`，只安装其余依赖，不会重复下载整套 PyTorch/CUDA。`uv` 下载缓存保存在 `/root/autodl-tmp/.cache/uv`；网络中断后重新执行 `scripts/install_autodl.sh` 会复用已经下载的文件。
+
 安装结束后先不要执行 `scripts/start_all.sh`。无 GPU 模式可以完成依赖安装和模型挂载，但不能运行 MiniMax-H3 推理。
 
 ## 5. 在无 GPU 模式挂载公共模型
@@ -245,6 +345,24 @@ scripts/start_all.sh
 ```
 
 ## 常见安装问题
+
+### ComfyUI 安装很慢
+
+新版脚本正常安装时会出现：
+
+```text
+正在快速安装 ComfyUI 依赖；复用基础镜像的 torch/torchvision，不重复下载 CUDA 大包。
+```
+
+如果终端正在下载文件名以 `torch-` 或 `nvidia-` 开头的数 GB 大包，说明服务器使用的还是旧安装脚本。可以按 `Ctrl+C` 停止，上传最新项目后重新执行：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+chmod +x scripts/*.sh
+scripts/install_autodl.sh
+```
+
+不需要删除 `/root/autodl-tmp/ComfyUI`；脚本会保留已经克隆的源码和下载缓存，从未完成的位置继续安装。如果只是网络暂时中断，直接重复执行同一条安装命令即可。
 
 ### 页面显示“ComfyUI 未连接（6008）”
 
@@ -358,6 +476,7 @@ URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接
 
 - 客户端和任务 API：`6006`
 - ComfyUI 节点和 API：`6008`
+- 安装下载缓存：`/root/autodl-tmp/.cache/uv`
 - 队列数据库：`$H3_STUDIO_DATA_DIR/studio.db`
 - 生成结果：`$H3_STUDIO_DATA_DIR/outputs`
 - ComfyUI 工作流：`workflows/minimax_h3_ref2va_api.json`
