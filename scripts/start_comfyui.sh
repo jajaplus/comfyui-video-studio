@@ -10,14 +10,16 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-COMFY_DIR="${H3_COMFYUI_DIR:-/root/ComfyUI}"
+COMFY_DIR="${H3_COMFYUI_DIR:-/root/autodl-tmp/ComfyUI}"
 if [[ ! -f "$COMFY_DIR/main.py" ]]; then
-  echo "找不到 $COMFY_DIR/main.py。请使用 AutoDL 的 ComfyUI 应用镜像，或在 .env 设置 H3_COMFYUI_DIR。" >&2
+  echo "找不到 $COMFY_DIR/main.py。请先运行 scripts/install_autodl.sh，或在 .env 设置 H3_COMFYUI_DIR。" >&2
   exit 1
 fi
 
 if [[ -n "${H3_COMFYUI_PYTHON:-}" ]]; then
   COMFY_PYTHON="$H3_COMFYUI_PYTHON"
+elif [[ -x "$COMFY_DIR/.venv/bin/python" ]]; then
+  COMFY_PYTHON="$COMFY_DIR/.venv/bin/python"
 elif [[ -x "$COMFY_DIR/venv/bin/python" ]]; then
   COMFY_PYTHON="$COMFY_DIR/venv/bin/python"
 elif [[ -x /root/miniconda3/envs/comfyui/bin/python ]]; then
@@ -26,7 +28,19 @@ else
   COMFY_PYTHON=python3
 fi
 
+if ! "$COMFY_PYTHON" - <<'PY'
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit(1)
+print(f"GPU 检查通过：{torch.cuda.get_device_name(0)}；PyTorch {torch.__version__}；CUDA {torch.version.cuda}")
+PY
+then
+  echo "当前没有可用 GPU。请先关闭 AutoDL 无卡实例，切换为 GPU 模式开机，再启动 ComfyUI。" >&2
+  exit 1
+fi
+
 exec "$COMFY_PYTHON" "$COMFY_DIR/main.py" \
-  --listen 127.0.0.1 \
-  --port 8188 \
+  --listen 0.0.0.0 \
+  --port 6008 \
   --disable-auto-launch

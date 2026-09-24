@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
 if [[ "$#" -ne 4 ]]; then
   echo "用法：$0 REF2VA模型路径 文本编码器路径 视频VAE路径 音频VAE路径" >&2
   echo "四个源路径请从 AutoDL 公共模型页面复制，通常以 /.autodl/ 开头。" >&2
   exit 2
 fi
 
-COMFY_DIR="${H3_COMFYUI_DIR:-/root/ComfyUI}"
+COMFY_DIR="${H3_COMFYUI_DIR:-/root/autodl-tmp/ComfyUI}"
 UNET_SOURCE="$1"
 CLIP_SOURCE="$2"
 VIDEO_VAE_SOURCE="$3"

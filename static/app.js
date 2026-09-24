@@ -223,13 +223,16 @@ async function loadHealth() {
     if (data.engine === 'ok') {
       element.className = 'health ok';
       element.querySelector('b').textContent = 'ComfyUI 正常';
+      element.title = `已连接 ${data.engine_url || 'ComfyUI'}`;
     } else {
       element.className = 'health bad';
-      element.querySelector('b').textContent = 'ComfyUI 未启动';
+      element.querySelector('b').textContent = 'ComfyUI 未连接（6008）';
+      element.title = `客户端无法连接 ${data.engine_url || 'http://127.0.0.1:6008'}`;
     }
   } catch (_) {
     element.className = 'health bad';
     element.querySelector('b').textContent = '服务连接失败';
+    element.title = '无法访问客户端健康检查接口';
   }
 }
 

@@ -27,4 +27,4 @@ else
   echo "网页服务已启动，日志：logs/app.log"
 fi
 
-echo "网页监听 6006 端口，ComfyUI 仅监听本机 8188 端口。"
+echo "客户端监听 6006 端口，ComfyUI 监听 6008 端口。"
