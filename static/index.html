@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiniMax H3 视频工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2378e6c5'/%3E%3Cpath d='M16 18h8v11h16V18h8v28h-8V36H24v10h-8z' fill='%23071018'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">MINIMAX H3 · REF2VA</div>
+        <h1>视频替换工作台</h1>
+        <p>上传源视频与参考素材，批量生成替换人物或商品的新视频。</p>
+      </div>
+      <div class="health" id="health"><span></span><b>正在连接</b></div>
+    </header>
+
+    <main>
+      <section class="stats" aria-label="任务统计">
+        <article><span>排队</span><strong id="queuedCount">0</strong></article>
+        <article><span>生成中</span><strong id="runningCount">0</strong></article>
+        <article><span>已完成</span><strong id="completedCount">0</strong></article>
+        <article><span>失败</span><strong id="failedCount">0</strong></article>
+      </section>
+
+      <section class="workspace">
+        <div class="panel create-panel">
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="single">新建任务</button>
+            <button class="tab" data-tab="excel">Excel 批量导入</button>
+          </div>
+
+          <form id="singleForm" class="form tab-content active">
+            <label>任务名称<input name="name" placeholder="例如：秋季新品广告"></label>
+            <div class="file-field required">
+              <label for="sourceVideo">源视频</label>
+              <input id="sourceVideo" name="source_video" type="file" accept="video/*,.mkv" required>
+              <p>模型会读取选定片段的动作、镜头、场景和声音。</p>
+            </div>
+            <div class="two-col">
+              <div class="file-field">
+                <label for="characterImage">人物参考图</label>
+                <input id="characterImage" name="character_image" type="file" accept="image/png,image/jpeg,image/webp">
+                <p>建议正面、清晰、无遮挡。</p>
+              </div>
+              <div class="file-field">
+                <label for="productImage">商品参考图</label>
+                <input id="productImage" name="product_image" type="file" accept="image/png,image/jpeg,image/webp">
+                <p>建议白底或主体边缘清晰。</p>
+              </div>
+            </div>
+            <label>补充要求<textarea name="prompt" rows="4" placeholder="例如：保持原视频的服装、运镜和背景，只替换人物面孔及手中的商品。"></textarea></label>
+            <div class="three-col">
+              <label>时长（秒）<input name="duration" type="number" value="5" min="4" max="15" required></label>
+              <label>画面比例
+                <select name="aspect_ratio">
+                  <option>16:9</option><option>9:16</option><option>1:1</option>
+                  <option>4:3</option><option>3:4</option><option>21:9</option><option>auto</option>
+                </select>
+              </label>
+              <label>源视频起点<input name="source_start" type="number" value="0" min="0" step="0.1"></label>
+            </div>
+            <details>
+              <summary>高级设置</summary>
+              <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
+            </details>
+            <button class="primary" type="submit">加入生成队列</button>
+          </form>
+
+          <form id="excelForm" class="form tab-content">
+            <div class="bulk-intro">
+              <h2>批量创建任务</h2>
+              <p>先下载模板。Excel 每行代表一个任务，素材列填写文件名；导入时同时选择这些视频和图片。</p>
+              <a id="templateLink" class="secondary" href="/api/template">下载 Excel 模板</a>
+            </div>
+            <div class="file-field required">
+              <label for="excelFile">任务表</label>
+              <input id="excelFile" name="excel" type="file" accept=".xlsx,.xlsm" required>
+            </div>
+            <div class="file-field required">
+              <label for="mediaFiles">表中引用的全部素材</label>
+              <input id="mediaFiles" name="media" type="file" accept="video/*,image/*,.mkv" multiple required>
+              <p>按文件名匹配，不要求按任务分文件夹。文件名不能重复。</p>
+            </div>
+            <button class="primary" type="submit">导入并加入队列</button>
+            <div id="importResult" class="import-result hidden"></div>
+          </form>
+        </div>
+
+        <div class="panel queue-panel">
+          <div class="panel-title">
+            <div><h2>任务队列</h2><p>同一台服务器按顺序生成，刷新页面不会丢失。</p></div>
+            <button class="icon-button" id="refreshButton" title="刷新">↻</button>
+          </div>
+          <div id="taskList" class="task-list">
+            <div class="empty">还没有任务</div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="notice">
+        <b>生成边界</b>
+        <p>Ref2VA 会依据源视频重新生成内容，并非逐帧贴图。快速动作、手部遮挡、小字包装和长镜头可能出现变化。每个任务建议先测试 4–5 秒片段。</p>
+      </aside>
+    </main>
+  </div>
+
+  <dialog id="tokenDialog">
+    <form method="dialog" id="tokenForm">
+      <h2>输入访问令牌</h2>
+      <p>服务器已开启访问保护。令牌只保存在当前浏览器。</p>
+      <input id="tokenInput" type="password" autocomplete="current-password" required placeholder="H3_STUDIO_TOKEN">
+      <button class="primary" value="default">进入工作台</button>
+    </form>
+  </dialog>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
