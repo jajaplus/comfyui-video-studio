@@ -166,10 +166,10 @@ ComfyUI 和任务数据都位于 `/root/autodl-tmp` 数据盘。实例释放前�
 cd /root/autodl-tmp/comfyui-video-studio
 
 scripts/link_autodl_models.sh \
-  '/.autodl/Ref2VA文件对应路径' \
-  '/.autodl/文本编码器对应路径' \
-  '/.autodl/视频VAE对应路径' \
-  '/.autodl/音频VAE对应路径'
+  '/.autodl/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors' \
+  '/.autodl/Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors ' \
+  '/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d' \
+  '/.autodl/Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors'
 ```
 
 脚本只创建软链接。如果 AutoDL 页面已经给出了 `ln -s` 命令，也可以直接执行页面提供的命令，但目标文件名和目录必须与上表一致。
