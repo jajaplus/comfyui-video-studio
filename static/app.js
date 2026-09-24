@@ -47,6 +47,11 @@ function formatSeconds(value) {
   return Number.isInteger(number) ? `${number}` : number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+function formatMegabytes(value) {
+  const number = Number(value || 0);
+  return number >= 1024 ? `${(number / 1024).toFixed(1)} GB` : `${Math.round(number)} MB`;
+}
+
 function isVideo(file) {
   return file.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi)$/i.test(file.name);
 }
@@ -187,6 +192,8 @@ function renderTasks() {
       ? `<a href="${task.download_url}" data-download="${task.id}">下载成片</a>` : '';
     const retry = ['failed', 'cancelled'].includes(task.status)
       ? `<button data-retry="${task.id}">重试</button>` : '';
+    const progressValue = Math.max(0, Math.min(100, Number(task.progress || 0)));
+    const stage = task.stage || (task.status === 'queued' ? '等待队列' : status);
     return `<article class="task">
       <div class="task-main">
         <div class="task-head">
@@ -198,11 +205,52 @@ function renderTasks() {
           <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>
         </div>
         ${error}
-        <div class="progress"><div style="width:${Math.max(0, Math.min(100, task.progress || 0))}%"></div></div>
+        <div class="task-stage"><span>${escapeHtml(stage)}</span><strong>${progressValue}%</strong></div>
+        <div class="progress"><div style="width:${progressValue}%"></div></div>
       </div>
       <div class="task-actions">${download}${retry}<button class="delete" data-delete="${task.id}">删除</button></div>
     </article>`;
   }).join('');
+}
+
+function setMeter(id, value) {
+  $(id).style.width = `${Math.max(0, Math.min(100, Number(value || 0)))}%`;
+}
+
+function renderGpuStatus(payload) {
+  const panel = $('#gpuPanel');
+  const gpuStatus = payload.gpu || {};
+  const gpu = (gpuStatus.gpus || [])[0];
+  if (!gpuStatus.available || !gpu) {
+    panel.classList.add('unavailable');
+    $('#gpuName').textContent = '未检测到 NVIDIA GPU';
+    $('#gpuState').textContent = '不可用';
+    $('#gpuUtilization').textContent = '--';
+    $('#gpuMemory').textContent = '--';
+    $('#gpuTemperature').textContent = '--';
+    $('#gpuPower').textContent = '--';
+    setMeter('#gpuUtilizationBar', 0);
+    setMeter('#gpuMemoryBar', 0);
+    return;
+  }
+  panel.classList.remove('unavailable');
+  const extra = gpuStatus.gpus.length > 1 ? ` · 共 ${gpuStatus.gpus.length} 张` : '';
+  $('#gpuName').textContent = `${gpu.name}${extra}`;
+  $('#gpuState').textContent = gpu.utilization > 0 ? '运行中' : '空闲';
+  $('#gpuUtilization').textContent = `${gpu.utilization.toFixed(0)}%`;
+  $('#gpuMemory').textContent = `${formatMegabytes(gpu.memory_used_mb)} / ${formatMegabytes(gpu.memory_total_mb)}`;
+  $('#gpuTemperature').textContent = `${gpu.temperature_c.toFixed(0)} °C`;
+  $('#gpuPower').textContent = `${gpu.power_draw_w.toFixed(0)} / ${gpu.power_limit_w.toFixed(0)} W`;
+  setMeter('#gpuUtilizationBar', gpu.utilization);
+  setMeter('#gpuMemoryBar', gpu.memory_percent);
+}
+
+async function loadSystemStatus() {
+  try {
+    renderGpuStatus(await api('/api/system/status'));
+  } catch (_) {
+    renderGpuStatus({ gpu: { available: false, gpus: [] } });
+  }
 }
 
 async function loadTasks(silent = false) {
@@ -332,7 +380,8 @@ $('#taskList').addEventListener('click', async (event) => {
 $('#refreshButton').addEventListener('click', () => { loadTasks(); loadHealth(); });
 
 (async function init() {
-  await Promise.all([loadTasks(true), loadHealth()]);
+  await Promise.all([loadTasks(true), loadHealth(), loadSystemStatus()]);
   setInterval(() => loadTasks(true), 3000);
+  setInterval(loadSystemStatus, 3000);
   setInterval(loadHealth, 15000);
 })();

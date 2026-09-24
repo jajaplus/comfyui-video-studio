@@ -73,12 +73,13 @@ class StudioSmokeTest(unittest.TestCase):
 
         with patch.object(self.main, "http_json", side_effect=fake_http), patch.object(
             self.main, "download_comfy_output", side_effect=fake_download
-        ):
+        ), patch.object(self.main, "open_comfy_websocket", return_value=None):
             self.main.process_task(row)
 
         with self.main.connect_db() as conn:
             completed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["stage"], "生成完成")
         self.assertTrue(Path(completed["output_path"]).is_file())
         result = self.main.delete_task(task_id)
         self.assertTrue(result["deleted"])
@@ -145,6 +146,30 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual([row["name"] for row in rows], ["one", "two"])
         self.assertEqual([row["duration"] for row in rows], [5.2, 8.4])
         self.assertTrue(all(len(json.loads(row["reference_images"])) == 2 for row in rows))
+
+    def test_04_gpu_status_parser(self) -> None:
+        parsed = self.main.parse_nvidia_smi(
+            "0, NVIDIA L40S, 87, 36120, 46068, 68, 287.4, 350.0\n"
+        )
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["name"], "NVIDIA L40S")
+        self.assertEqual(parsed[0]["utilization"], 87.0)
+        self.assertEqual(parsed[0]["memory_used_mb"], 36120.0)
+        self.assertAlmostEqual(parsed[0]["memory_percent"], 78.4)
+
+    def test_05_comfy_sampling_progress(self) -> None:
+        workflow = {"125": {"class_type": "SamplerCustomAdvanced", "_meta": {"title": "采样器"}}}
+        with patch.object(self.main, "mark_task") as mark:
+            finished = self.main.apply_comfy_event(
+                "task-1", "prompt-1", workflow,
+                {"type": "progress", "data": {
+                    "prompt_id": "prompt-1", "node": "125", "value": 10, "max": 20,
+                }},
+            )
+        self.assertFalse(finished)
+        values = mark.call_args.kwargs
+        self.assertEqual(values["stage"], "采样生成视频（10/20）")
+        self.assertGreater(values["progress"], 50)
 
 
 if __name__ == "__main__":

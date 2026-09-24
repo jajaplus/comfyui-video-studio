@@ -6,9 +6,33 @@
 
 如果服务器根目录已经存在 `/root/ComfyUI` 和 `/root/start.sh`，使用本节即可，不要再运行 `scripts/install_autodl.sh`。后面的“基础镜像安装 ComfyUI”章节只用于没有 `/root/ComfyUI` 的服务器。
 
-### 1. 上传并解压项目
+### 1. 压缩、上传并解压项目
 
-在 Mac 上传已经生成的压缩包：
+先在 Mac 终端压缩项目：
+
+```bash
+cd /Users/linyongjia/Desktop
+
+tar \
+  --exclude='comfyui-video-studio/.venv' \
+  --exclude='comfyui-video-studio/data' \
+  --exclude='comfyui-video-studio/logs' \
+  --exclude='comfyui-video-studio/.git' \
+  --exclude='comfyui-video-studio/__pycache__' \
+  --exclude='comfyui-video-studio/.DS_Store' \
+  -czf comfyui-video-studio.tar.gz \
+  comfyui-video-studio
+
+ls -lh /Users/linyongjia/Desktop/comfyui-video-studio.tar.gz
+```
+
+压缩包会生成在：
+
+```text
+/Users/linyongjia/Desktop/comfyui-video-studio.tar.gz
+```
+
+然后在 Mac 上传压缩包：
 
 ```bash
 scp -P 你的SSH端口 \
@@ -109,6 +133,8 @@ curl --max-time 5 http://127.0.0.1:6006/health
 - 生成时长跟随上传视频，画面比例默认跟随视频方向。
 - Excel 一次最多导入 3 个任务，素材 URL 由用户自行填写。
 - SQLite 持久化队列，支持查看进度、下载、失败重试和删除任务。
+- 客户端实时显示 GPU 利用率、显存、温度和功耗，每 3 秒刷新。
+- 当前任务显示准备素材、模型加载、参考编码、采样步数、视频解码和保存等生成环节。
 - 通过 ComfyUI 原生 `MiniMaxH3ReferenceToVideo` 工作流生成带声音的视频。
 
 MiniMax-H3 Ref2VA 会重新生成画面与声音，不能保证逐帧复制原视频，也不是传统的像素级换脸或商品贴片。快速动作、遮挡、手部接触和包装小字可能发生变化。
@@ -476,6 +502,7 @@ URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接
 
 - 客户端和任务 API：`6006`
 - ComfyUI 节点和 API：`6008`
+- GPU 与运行状态接口：`/api/system/status`
 - 安装下载缓存：`/root/autodl-tmp/.cache/uv`
 - 队列数据库：`$H3_STUDIO_DATA_DIR/studio.db`
 - 生成结果：`$H3_STUDIO_DATA_DIR/outputs`

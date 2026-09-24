@@ -61,6 +61,9 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 worker_stop = threading.Event()
 worker_thread: threading.Thread | None = None
+gpu_cache_lock = threading.Lock()
+gpu_cache_at = 0.0
+gpu_cache_value: dict[str, Any] = {"available": False, "gpus": []}
 
 
 def utcnow() -> str:
@@ -106,6 +109,7 @@ def init_db() -> None:
                 output_path TEXT,
                 error TEXT,
                 progress INTEGER NOT NULL DEFAULT 0,
+                stage TEXT,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 deleted_at TEXT,
                 created_at TEXT NOT NULL,
@@ -117,14 +121,16 @@ def init_db() -> None:
                 ON tasks(status, deleted_at, created_at);
             """
         )
-        conn.execute(
-            "UPDATE tasks SET status='queued', progress=0, started_at=NULL, "
-            "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
-            (utcnow(),),
-        )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "reference_images" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN reference_images TEXT")
+        if "stage" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN stage TEXT")
+        conn.execute(
+            "UPDATE tasks SET status='queued', progress=0, stage='等待队列', started_at=NULL, "
+            "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
+            (utcnow(),),
+        )
 
 
 def validate_extension(filename: str, allowed: set[str], label: str) -> None:
@@ -253,12 +259,12 @@ def insert_task(
         conn.execute(
             """INSERT INTO tasks (
                 id,name,status,prompt,source_video,reference_images,
-                duration,aspect_ratio,source_start,seed,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                duration,aspect_ratio,source_start,seed,stage,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, name or f"视频-{task_id[:6]}", "queued", prompt.strip(),
                 source_text, json.dumps([str(path) for path in reference_images], ensure_ascii=False),
-                duration, aspect_ratio, 0, actual_seed, now, now,
+                duration, aspect_ratio, 0, actual_seed, "等待队列", now, now,
             ),
         )
     return task_id
@@ -326,6 +332,133 @@ def http_json(method: str, url: str, payload: dict[str, Any] | None = None, time
         raise RuntimeError(f"ComfyUI 返回 HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"无法连接 ComfyUI {COMFYUI_URL}: {exc.reason}") from exc
+
+
+def parse_nvidia_smi(output: str) -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != 8:
+            continue
+        try:
+            index, name, utilization, memory_used, memory_total, temperature, power_draw, power_limit = values
+            used = float(memory_used)
+            total = float(memory_total)
+            gpus.append({
+                "index": int(index),
+                "name": name,
+                "utilization": float(utilization),
+                "memory_used_mb": used,
+                "memory_total_mb": total,
+                "memory_percent": round(used / total * 100, 1) if total else 0,
+                "temperature_c": float(temperature),
+                "power_draw_w": float(power_draw),
+                "power_limit_w": float(power_limit),
+            })
+        except ValueError:
+            continue
+    return gpus
+
+
+def gpu_status() -> dict[str, Any]:
+    global gpu_cache_at, gpu_cache_value
+    now = time.monotonic()
+    with gpu_cache_lock:
+        if now - gpu_cache_at < 2:
+            return gpu_cache_value
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,"
+                    "temperature.gpu,power.draw,power.limit",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True, capture_output=True, text=True, timeout=3,
+            )
+            gpus = parse_nvidia_smi(completed.stdout)
+            gpu_cache_value = {"available": bool(gpus), "gpus": gpus, "error": None}
+        except (FileNotFoundError, subprocess.SubprocessError) as exc:
+            gpu_cache_value = {"available": False, "gpus": [], "error": type(exc).__name__}
+        gpu_cache_at = now
+        return gpu_cache_value
+
+
+def comfy_websocket_url(client_id: str) -> str:
+    parsed = urlparse(COMFYUI_URL)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{scheme}://{parsed.netloc}/ws?{urlencode({'clientId': client_id})}"
+
+
+def open_comfy_websocket(client_id: str):
+    try:
+        from websockets.sync.client import connect
+        return connect(comfy_websocket_url(client_id), open_timeout=3, close_timeout=1)
+    except Exception:
+        return None
+
+
+def comfy_node_stage(workflow: dict[str, Any], node_id: Any) -> tuple[str, int]:
+    node = workflow.get(str(node_id), {})
+    class_type = str(node.get("class_type") or "")
+    title = str((node.get("_meta") or {}).get("title") or class_type)
+    if class_type in {"LoadVideo", "GetVideoComponents", "LoadImage"}:
+        return "读取参考素材", 18
+    if class_type in {"UNETLoader", "CLIPLoader", "VAELoader"}:
+        return f"加载模型：{title}", 22
+    if class_type == "MiniMaxH3ReferenceToVideo":
+        return "编码视频、图片与提示词", 30
+    if class_type in {"BasicScheduler", "BasicGuider", "KSamplerSelect", "RandomNoise"}:
+        return "准备采样参数", 34
+    if class_type == "SamplerCustomAdvanced":
+        return "采样生成视频", 36
+    if class_type == "VAEDecode":
+        return "解码视频画面", 90
+    if class_type == "VAEDecodeAudio":
+        return "解码音频", 92
+    if class_type == "CreateVideo":
+        return "合成视频与音频", 95
+    if class_type == "SaveVideo":
+        return "保存生成视频", 97
+    return (f"执行节点：{title}" if title else "ComfyUI 生成中"), 20
+
+
+def apply_comfy_event(
+    task_id: str, prompt_id: str, workflow: dict[str, Any], message: dict[str, Any]
+) -> bool:
+    event_type = message.get("type")
+    data = message.get("data") or {}
+    if data.get("prompt_id") not in {None, prompt_id}:
+        return False
+    if event_type == "execution_start":
+        mark_task(task_id, stage="ComfyUI 开始执行", progress=17)
+    elif event_type == "executing":
+        node_id = data.get("node")
+        if node_id is None and data.get("prompt_id") == prompt_id:
+            mark_task(task_id, stage="ComfyUI 执行完成", progress=94)
+            return True
+        stage, progress = comfy_node_stage(workflow, node_id)
+        mark_task(task_id, stage=stage, progress=progress)
+    elif event_type == "progress":
+        value = float(data.get("value") or 0)
+        maximum = float(data.get("max") or 0)
+        stage, base = comfy_node_stage(workflow, data.get("node"))
+        if maximum > 0:
+            percent = min(1.0, max(0.0, value / maximum))
+            progress = max(base, min(89, 36 + round(percent * 53)))
+            stage = f"{stage}（{value:g}/{maximum:g}）"
+            mark_task(task_id, stage=stage, progress=progress)
+    elif event_type == "progress_state":
+        nodes = data.get("nodes") or {}
+        running = next((item for item in nodes.values() if item.get("state") == "running"), None)
+        if running:
+            display_id = running.get("display_node_id") or running.get("real_node_id") or running.get("node_id")
+            synthetic = {"type": "progress", "data": {
+                "prompt_id": prompt_id, "node": display_id,
+                "value": running.get("value"), "max": running.get("max"),
+            }}
+            apply_comfy_event(task_id, prompt_id, workflow, synthetic)
+    return False
 
 
 def copy_media_to_comfy(source: str | Path, destination: Path) -> None:
@@ -510,7 +643,7 @@ def claim_next_task() -> sqlite3.Row | None:
             return None
         now = utcnow()
         conn.execute(
-            "UPDATE tasks SET status='starting',progress=5,started_at=?,updated_at=? WHERE id=?",
+            "UPDATE tasks SET status='starting',progress=5,stage='准备任务素材',started_at=?,updated_at=? WHERE id=?",
             (now, now, row["id"]),
         )
         return conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
@@ -536,17 +669,26 @@ def process_task(row: sqlite3.Row) -> None:
     task_id = row["id"]
     prompt_id: str | None = None
     comfy_input_folder: Path | None = None
+    websocket = None
     try:
+        mark_task(task_id, stage="复制视频和参考图片", progress=8)
         source_upload, reference_uploads, comfy_input_folder = prepare_comfy_inputs(row)
+        mark_task(task_id, stage="构建 MiniMax-H3 工作流", progress=12)
         workflow = build_comfy_workflow(row, source_upload, reference_uploads)
+        client_id = f"h3-studio-{task_id}"
+        websocket = open_comfy_websocket(client_id)
+        mark_task(task_id, stage="提交任务到 ComfyUI", progress=14)
         submitted = http_json(
             "POST", f"{COMFYUI_URL}/prompt",
-            {"prompt": workflow, "client_id": f"h3-studio-{task_id}"}, timeout=120,
+            {"prompt": workflow, "client_id": client_id}, timeout=120,
         )
         prompt_id = str(submitted.get("prompt_id") or "")
         if not prompt_id:
             raise RuntimeError(f"ComfyUI 未返回 prompt_id：{submitted}")
-        mark_task(task_id, status="running", progress=15, engine_job_id=prompt_id)
+        mark_task(
+            task_id, status="running", progress=15, stage="等待 ComfyUI 执行",
+            engine_job_id=prompt_id,
+        )
 
         started = time.monotonic()
         history_record: dict[str, Any] | None = None
@@ -555,8 +697,28 @@ def process_task(row: sqlite3.Row) -> None:
             if control is None or control["cancel_requested"] or control["deleted_at"]:
                 try_cancel_comfy(prompt_id)
                 if control is not None and not control["deleted_at"]:
-                    mark_task(task_id, status="cancelled", progress=0, finished_at=utcnow())
+                    mark_task(
+                        task_id, status="cancelled", progress=0,
+                        stage="任务已取消", finished_at=utcnow(),
+                    )
                 return
+            if websocket is not None:
+                try:
+                    raw_message = websocket.recv(timeout=POLL_SECONDS)
+                    if isinstance(raw_message, str):
+                        event_finished = apply_comfy_event(
+                            task_id, prompt_id, workflow, json.loads(raw_message)
+                        )
+                        if event_finished:
+                            mark_task(task_id, stage="读取生成结果", progress=94)
+                except TimeoutError:
+                    pass
+                except Exception:
+                    try:
+                        websocket.close()
+                    except Exception:
+                        pass
+                    websocket = None
             history = http_json("GET", f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
             history_record = history.get(prompt_id)
             if history_record is not None:
@@ -565,9 +727,10 @@ def process_task(row: sqlite3.Row) -> None:
             if elapsed > COMFYUI_TIMEOUT:
                 try_cancel_comfy(prompt_id)
                 raise TimeoutError(f"ComfyUI 生成超过 {COMFYUI_TIMEOUT} 秒")
-            progress = min(92, 18 + int(elapsed / 15))
-            mark_task(task_id, progress=progress)
-            worker_stop.wait(POLL_SECONDS)
+            if websocket is None:
+                progress = min(88, 18 + int(elapsed / 20))
+                mark_task(task_id, progress=progress, stage="ComfyUI 生成中")
+                worker_stop.wait(POLL_SECONDS)
         if worker_stop.is_set():
             try_cancel_comfy(prompt_id)
             return
@@ -575,7 +738,7 @@ def process_task(row: sqlite3.Row) -> None:
             raise RuntimeError("ComfyUI 未返回任务结果")
 
         destination = OUTPUT_DIR / f"{task_id}.mp4"
-        mark_task(task_id, progress=95)
+        mark_task(task_id, progress=96, stage="保存并传回生成视频")
         download_comfy_output(comfy_history_output(history_record), destination)
         try:
             http_json("POST", f"{COMFYUI_URL}/history", {"delete": [prompt_id]}, timeout=10)
@@ -583,11 +746,19 @@ def process_task(row: sqlite3.Row) -> None:
             pass
         mark_task(
             task_id, status="completed", progress=100, output_path=str(destination),
-            finished_at=utcnow(), error=None,
+            stage="生成完成", finished_at=utcnow(), error=None,
         )
     except Exception as exc:
-        mark_task(task_id, status="failed", progress=0, error=str(exc)[:4000], finished_at=utcnow())
+        mark_task(
+            task_id, status="failed", progress=0, stage="生成失败",
+            error=str(exc)[:4000], finished_at=utcnow(),
+        )
     finally:
+        if websocket is not None:
+            try:
+                websocket.close()
+            except Exception:
+                pass
         if comfy_input_folder is not None:
             shutil.rmtree(comfy_input_folder, ignore_errors=True)
 
@@ -620,6 +791,11 @@ app = FastAPI(title="MiniMax H3 Video Studio", version="2.0.0", lifespan=lifespa
 @app.get("/api/config")
 def config() -> dict[str, Any]:
     return {"max_upload_gb": MAX_UPLOAD_GB, "engine": "comfyui"}
+
+
+@app.get("/api/system/status")
+def system_status() -> dict[str, Any]:
+    return {"gpu": gpu_status(), "updated_at": utcnow()}
 
 
 @app.get("/health")
@@ -803,7 +979,7 @@ def retry_task(task_id: str) -> dict[str, Any]:
         if row["status"] not in {"failed", "cancelled"}:
             raise HTTPException(409, "只有失败或已取消的任务可以重试")
         conn.execute(
-            "UPDATE tasks SET status='queued',progress=0,error=NULL,cancel_requested=0,"
+            "UPDATE tasks SET status='queued',progress=0,stage='等待队列',error=NULL,cancel_requested=0,"
             "engine_job_id=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?",
             (utcnow(), task_id),
         )

@@ -26,6 +26,25 @@
         <article><span>失败</span><strong id="failedCount">0</strong></article>
       </section>
 
+      <section class="gpu-panel" id="gpuPanel" aria-label="GPU 运行状态">
+        <div class="gpu-heading">
+          <div><span>服务器算力</span><strong id="gpuName">正在读取 GPU</strong></div>
+          <span class="gpu-state" id="gpuState">读取中</span>
+        </div>
+        <div class="gpu-metrics">
+          <article>
+            <div><span>GPU 占用</span><strong id="gpuUtilization">--</strong></div>
+            <div class="meter"><div id="gpuUtilizationBar"></div></div>
+          </article>
+          <article>
+            <div><span>显存</span><strong id="gpuMemory">--</strong></div>
+            <div class="meter"><div id="gpuMemoryBar"></div></div>
+          </article>
+          <article><span>温度</span><strong id="gpuTemperature">--</strong></article>
+          <article><span>功耗</span><strong id="gpuPower">--</strong></article>
+        </div>
+      </section>
+
       <section class="workspace">
         <div class="panel create-panel">
           <div class="tabs" role="tablist">
@@ -93,6 +112,6 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/app.js?v=4" defer></script>
+  <script src="/app.js?v=5" defer></script>
 </body>
 </html>
