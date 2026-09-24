@@ -3,9 +3,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -15,9 +17,10 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlencode, urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
@@ -31,12 +34,27 @@ DATA_DIR = Path(os.getenv("H3_STUDIO_DATA_DIR", ROOT / "data")).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 DB_PATH = DATA_DIR / "studio.db"
-ENGINE_URL = os.getenv("H3_ENGINE_URL", "http://127.0.0.1:30011").rstrip("/")
-API_TOKEN = os.getenv("H3_STUDIO_TOKEN", "").strip()
+COMFYUI_URL = os.getenv("H3_COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+COMFYUI_DIR = Path(os.getenv("H3_COMFYUI_DIR", "/root/ComfyUI")).resolve()
+COMFYUI_INPUT_DIR = Path(os.getenv("H3_COMFYUI_INPUT_DIR", COMFYUI_DIR / "input")).resolve()
+COMFYUI_OUTPUT_DIR = Path(os.getenv("H3_COMFYUI_OUTPUT_DIR", COMFYUI_DIR / "output")).resolve()
+COMFYUI_WORKFLOW = Path(
+    os.getenv("H3_COMFYUI_WORKFLOW", ROOT / "workflows" / "minimax_h3_ref2va_api.json")
+).resolve()
+COMFYUI_TIMEOUT = max(300, int(os.getenv("H3_COMFYUI_TIMEOUT", "10800")))
+COMFYUI_UNET = os.getenv(
+    "H3_COMFYUI_UNET", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+)
+COMFYUI_CLIP = os.getenv(
+    "H3_COMFYUI_CLIP", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+)
+COMFYUI_VIDEO_VAE = os.getenv(
+    "H3_COMFYUI_VIDEO_VAE", "minimax_h3_video_vae_int8_convrot.safetensors"
+)
+COMFYUI_AUDIO_VAE = os.getenv("H3_COMFYUI_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
 POLL_SECONDS = max(1.0, float(os.getenv("H3_POLL_SECONDS", "3")))
 MAX_UPLOAD_GB = max(1, int(os.getenv("H3_MAX_UPLOAD_GB", "20")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_GB * 1024**3
-SERVER_ASSET_ROOT = os.getenv("H3_SERVER_ASSET_ROOT", "").strip()
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -79,7 +97,8 @@ def init_db() -> None:
                 source_video TEXT NOT NULL,
                 character_image TEXT,
                 product_image TEXT,
-                duration INTEGER NOT NULL,
+                reference_images TEXT,
+                duration REAL NOT NULL,
                 aspect_ratio TEXT NOT NULL,
                 source_start REAL NOT NULL DEFAULT 0,
                 seed INTEGER NOT NULL,
@@ -103,16 +122,9 @@ def init_db() -> None:
             "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
             (utcnow(),),
         )
-
-
-def is_authorized(authorization: str | None, x_api_key: str | None) -> bool:
-    if not API_TOKEN:
-        return True
-    bearer = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        bearer = authorization[7:].strip()
-    supplied = bearer or (x_api_key or "")
-    return secrets.compare_digest(supplied, API_TOKEN)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "reference_images" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN reference_images TEXT")
 
 
 def validate_extension(filename: str, allowed: set[str], label: str) -> None:
@@ -122,13 +134,56 @@ def validate_extension(filename: str, allowed: set[str], label: str) -> None:
         raise HTTPException(400, f"{label}格式不支持，请使用 {expected}")
 
 
-def validate_task_values(duration: int, aspect_ratio: str, source_start: float) -> None:
+def validate_task_values(duration: float, aspect_ratio: str) -> None:
     if duration < 4 or duration > 15:
-        raise HTTPException(400, "时长必须为 4–15 秒")
+        raise ValueError(f"上传视频时长为 {duration:.2f} 秒；MiniMax-H3 仅支持 4–15 秒")
     if aspect_ratio not in {"auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}:
-        raise HTTPException(400, "不支持的画面比例")
-    if source_start < 0:
-        raise HTTPException(400, "源视频起始秒数不能小于 0")
+        raise ValueError("不支持的画面比例")
+
+
+def is_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def validate_public_media_url(value: str, label: str) -> str:
+    value = value.strip()
+    if not is_http_url(value):
+        raise ValueError(f"{label}必须是完整的 http:// 或 https:// URL")
+    if urlparse(value).username or urlparse(value).password:
+        raise ValueError(f"{label}不能在 URL 中包含用户名或密码")
+    return value
+
+
+def media_display_name(value: str | Path) -> str:
+    text = str(value)
+    if is_http_url(text):
+        return Path(urlparse(text).path).name or urlparse(text).netloc
+    return Path(text).name
+
+
+def probe_video_duration(source: str | Path, hint: float | None = None) -> float:
+    duration: float | None = None
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        duration = float(completed.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        if hint is not None and hint > 0:
+            duration = float(hint)
+    if duration is None:
+        raise ValueError(f"无法读取视频“{media_display_name(source)}”的时长，请确认 URL 可公开访问或视频可正常播放")
+    duration = round(duration, 3)
+    validate_task_values(duration, "16:9")
+    return duration
 
 
 async def save_upload(upload: UploadFile, destination: Path, allowed: set[str], label: str) -> Path:
@@ -160,7 +215,8 @@ def task_to_dict(row: sqlite3.Row, queue_position: int | None = None) -> dict[st
     result = {key: row[key] for key in row.keys()}
     for field in ("source_video", "character_image", "product_image", "output_path"):
         if result.get(field):
-            result[field] = Path(result[field]).name
+            result[field] = media_display_name(result[field])
+    result["reference_images"] = [media_display_name(path) for path in row_reference_paths(row)]
     result["cancel_requested"] = bool(result["cancel_requested"])
     result["queue_position"] = queue_position
     result["download_url"] = f"/api/tasks/{row['id']}/output" if row["status"] == "completed" else None
@@ -168,33 +224,61 @@ def task_to_dict(row: sqlite3.Row, queue_position: int | None = None) -> dict[st
 
 
 def insert_task(
-    *, name: str, prompt: str, source_video: Path, character_image: Path | None,
-    product_image: Path | None, duration: int, aspect_ratio: str,
-    source_start: float, seed: int | None,
+    *, prompt: str, source_video: str | Path, reference_images: list[str | Path], duration: float,
+    aspect_ratio: str, seed: int | None, display_name: str | None = None,
 ) -> str:
-    validate_task_values(duration, aspect_ratio, source_start)
-    if not source_video.is_file() or source_video.suffix.lower() not in VIDEO_EXTENSIONS:
-        raise ValueError("source_video 必须是已上传的受支持视频文件")
-    for image, label in ((character_image, "character_image"), (product_image, "product_image")):
-        if image and (not image.is_file() or image.suffix.lower() not in IMAGE_EXTENSIONS):
-            raise ValueError(f"{label} 必须是已上传的受支持图片文件")
+    validate_task_values(duration, aspect_ratio)
+    source_text = str(source_video)
+    if is_http_url(source_text):
+        validate_public_media_url(source_text, "upload_video_url")
+    else:
+        source_path = Path(source_text)
+        if not source_path.is_file() or source_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValueError("upload_video 必须是已上传的受支持视频文件")
+    if len(reference_images) > 9:
+        raise ValueError("参考图片最多上传 9 张")
+    for image in reference_images:
+        image_text = str(image)
+        if is_http_url(image_text):
+            validate_public_media_url(image_text, "reference_image_url")
+        else:
+            image_path = Path(image_text)
+            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                raise ValueError("reference_images 必须是已上传的受支持图片文件")
     task_id = uuid.uuid4().hex
     now = utcnow()
     actual_seed = seed if seed is not None else secrets.randbelow(2_147_483_647)
+    name = Path(display_name or media_display_name(source_video)).stem
     with connect_db() as conn:
         conn.execute(
             """INSERT INTO tasks (
-                id,name,status,prompt,source_video,character_image,product_image,
+                id,name,status,prompt,source_video,reference_images,
                 duration,aspect_ratio,source_start,seed,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                task_id, name.strip() or f"任务-{task_id[:6]}", "queued", prompt.strip(),
-                str(source_video), str(character_image) if character_image else None,
-                str(product_image) if product_image else None, duration, aspect_ratio,
-                source_start, actual_seed, now, now,
+                task_id, name or f"视频-{task_id[:6]}", "queued", prompt.strip(),
+                source_text, json.dumps([str(path) for path in reference_images], ensure_ascii=False),
+                duration, aspect_ratio, 0, actual_seed, now, now,
             ),
         )
     return task_id
+
+
+def row_reference_paths(row: sqlite3.Row | dict[str, Any]) -> list[str]:
+    keys = set(row.keys())
+    raw = row["reference_images"] if "reference_images" in keys else None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(path) for path in parsed if path]
+        except (TypeError, json.JSONDecodeError):
+            pass
+    legacy = []
+    for field in ("character_image", "product_image"):
+        if field in keys and row[field]:
+            legacy.append(str(row[field]))
+    return legacy
 
 
 def build_h3_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
@@ -202,25 +286,17 @@ def build_h3_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
         "<Video 1> is the source video. Preserve its shot order, camera motion, subject motion, "
         "timing, composition, lighting, background, and synchronized soundtrack unless explicitly changed below."
     ]
+    reference_paths = row_reference_paths(row)
     instructions: list[str] = []
-    picture_index = 0
-    if row["character_image"]:
-        picture_index += 1
+    for picture_index, _ in enumerate(reference_paths, start=1):
         definitions.append(
-            f"<Picture {picture_index}> defines the replacement person's identity, face, hair, and appearance."
+            f"<Picture {picture_index}> is a user-provided visual reference for the replacement person, product, or both."
         )
+    if reference_paths:
         instructions.append(
-            f"Replace the principal person in <Video 1> with the person from <Picture {picture_index}>. "
-            "Transfer the original person's pose, motion, gaze, interaction, scale, placement, and timing to the replacement."
-        )
-    if row["product_image"]:
-        picture_index += 1
-        definitions.append(
-            f"<Picture {picture_index}> defines the replacement product's exact category, shape, colors, branding, and packaging."
-        )
-        instructions.append(
-            f"Replace the principal handled or displayed product in <Video 1> with the product from <Picture {picture_index}>. "
-            "Keep realistic size, perspective, occlusion, hand contact, reflections, shadows, and temporal consistency."
+            "Use the supplied <Picture> references according to the user's request. For a person, preserve identity, face, hair, "
+            "pose, motion, gaze, scale, placement, and timing. For a product, preserve category, shape, colors, branding, packaging, "
+            "perspective, occlusion, hand contact, reflections, shadows, and temporal consistency."
         )
     if not instructions:
         instructions.append("Apply the requested edit to <Video 1> while preserving all unspecified content.")
@@ -237,62 +313,184 @@ def build_h3_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
     )
 
 
-def build_engine_payload(row: sqlite3.Row) -> dict[str, Any]:
-    conditions: list[dict[str, Any]] = [
-        {
-            "type": "video",
-            "uri": Path(row["source_video"]).resolve().as_uri(),
-            "role": "reference",
-            "start_time_seconds": float(row["source_start"]),
-        }
-    ]
-    for path in (row["character_image"], row["product_image"]):
-        if path:
-            conditions.append({"type": "image", "uri": Path(path).resolve().as_uri(), "role": "reference"})
-    return {
-        "model": "MiniMaxAI/MiniMax-H3",
-        "prompt": build_h3_prompt(row),
-        "seconds": int(row["duration"]),
-        "task": "ref2va",
-        "conditions": conditions,
-        "target": {
-            "short_edge": 768,
-            "aspect_ratio": row["aspect_ratio"],
-            "duration_seconds": float(row["duration"]),
-        },
-        "num_outputs_per_prompt": 1,
-        "num_inference_steps": 50,
-        "flow_shift": 12.0,
-        "audio_flow_shift": 3.0,
-        "seed": int(row["seed"]),
-    }
-
-
 def http_json(method: str, url: str, payload: dict[str, Any] | None = None, timeout: int = 60) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=body, method=method)
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            content = response.read()
+            return json.loads(content.decode("utf-8")) if content else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:2000]
-        raise RuntimeError(f"H3 服务返回 HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"ComfyUI 返回 HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接 H3 服务 {ENGINE_URL}: {exc.reason}") from exc
+        raise RuntimeError(f"无法连接 ComfyUI {COMFYUI_URL}: {exc.reason}") from exc
 
 
-def try_cancel_engine(engine_job_id: str | None) -> None:
-    if not engine_job_id:
+def copy_media_to_comfy(source: str | Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_text = str(source)
+    written = 0
+    try:
+        if is_http_url(source_text):
+            request = urllib.request.Request(source_text, headers={"User-Agent": "H3-Studio/1.0"})
+            with urllib.request.urlopen(request, timeout=120) as response, destination.open("wb") as target:
+                while chunk := response.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise RuntimeError(f"远程素材不能超过 {MAX_UPLOAD_GB} GB")
+                    target.write(chunk)
+        else:
+            shutil.copy2(Path(source_text), destination)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def prepare_comfy_inputs(row: sqlite3.Row) -> tuple[str, list[str], Path]:
+    task_folder = COMFYUI_INPUT_DIR / "h3_studio" / row["id"]
+    task_folder.mkdir(parents=True, exist_ok=True)
+    try:
+        source_suffix = Path(urlparse(str(row["source_video"])).path).suffix.lower() or ".mp4"
+        if source_suffix not in VIDEO_EXTENSIONS:
+            source_suffix = ".mp4"
+        source_path = task_folder / f"source{source_suffix}"
+        copy_media_to_comfy(row["source_video"], source_path)
+
+        reference_names: list[str] = []
+        for index, source in enumerate(row_reference_paths(row), start=1):
+            suffix = Path(urlparse(str(source)).path).suffix.lower() or ".jpg"
+            if suffix not in IMAGE_EXTENSIONS:
+                suffix = ".jpg"
+            destination = task_folder / f"reference_{index:02d}{suffix}"
+            copy_media_to_comfy(source, destination)
+            reference_names.append(destination.relative_to(COMFYUI_INPUT_DIR).as_posix())
+        return source_path.relative_to(COMFYUI_INPUT_DIR).as_posix(), reference_names, task_folder
+    except Exception:
+        shutil.rmtree(task_folder, ignore_errors=True)
+        raise
+
+
+OUTPUT_DIMENSIONS = {
+    "16:9": (1344, 768),
+    "9:16": (768, 1344),
+    "1:1": (1024, 1024),
+    "4:3": (1024, 768),
+    "3:4": (768, 1024),
+    "21:9": (1568, 672),
+}
+
+
+def source_aspect_ratio(source: str | Path) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(source),
+            ],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        width, height = (int(value) for value in completed.stdout.strip().split("x", 1))
+        ratio = width / height
+        return min(OUTPUT_DIMENSIONS, key=lambda name: abs(ratio - OUTPUT_DIMENSIONS[name][0] / OUTPUT_DIMENSIONS[name][1]))
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, ZeroDivisionError):
+        return "16:9"
+
+
+def next_workflow_node_id(workflow: dict[str, Any]) -> str:
+    return str(max(int(node_id) for node_id in workflow) + 1)
+
+
+def build_comfy_workflow(row: sqlite3.Row, source_upload: str, reference_uploads: list[str]) -> dict[str, Any]:
+    if not COMFYUI_WORKFLOW.is_file():
+        raise RuntimeError(f"找不到 ComfyUI 工作流：{COMFYUI_WORKFLOW}")
+    workflow = json.loads(COMFYUI_WORKFLOW.read_text(encoding="utf-8"))
+    sampler = workflow["136"]["inputs"]
+    local_source = COMFYUI_INPUT_DIR / source_upload
+    ratio = row["aspect_ratio"] if row["aspect_ratio"] != "auto" else source_aspect_ratio(local_source)
+    width, height = OUTPUT_DIMENSIONS[ratio]
+    sampler["width"] = width
+    sampler["height"] = height
+    workflow["132"]["inputs"]["value"] = float(row["duration"])
+    workflow["129"]["inputs"]["noise_seed"] = int(row["seed"])
+    workflow["138"]["inputs"]["value"] = build_h3_prompt(row)
+    workflow["92"]["inputs"]["filename_prefix"] = f"h3_studio/{row['id']}"
+    workflow["127"]["inputs"]["unet_name"] = COMFYUI_UNET
+    workflow["128"]["inputs"]["clip_name"] = COMFYUI_CLIP
+    workflow["119"]["inputs"]["vae_name"] = COMFYUI_VIDEO_VAE
+    workflow["120"]["inputs"]["vae_name"] = COMFYUI_AUDIO_VAE
+
+    for key in list(sampler):
+        if key.startswith(("ref_images.ref_image_", "ref_videos.ref_video_", "ref_video_audios.ref_video_audio_")):
+            del sampler[key]
+    for node_id in list(workflow):
+        if workflow[node_id]["class_type"] in {"LoadImage", "LoadVideo", "GetVideoComponents"}:
+            del workflow[node_id]
+
+    load_video_id = next_workflow_node_id(workflow)
+    workflow[load_video_id] = {
+        "class_type": "LoadVideo", "inputs": {"file": source_upload},
+        "_meta": {"title": "上传视频"},
+    }
+    components_id = next_workflow_node_id(workflow)
+    workflow[components_id] = {
+        "class_type": "GetVideoComponents", "inputs": {"video": [load_video_id, 0]},
+        "_meta": {"title": "读取视频画面与声音"},
+    }
+    sampler["ref_videos.ref_video_0"] = [components_id, 0]
+    sampler["ref_video_audios.ref_video_audio_0"] = [components_id, 1]
+
+    for index, uploaded_name in enumerate(reference_uploads[:9]):
+        node_id = next_workflow_node_id(workflow)
+        workflow[node_id] = {
+            "class_type": "LoadImage", "inputs": {"image": uploaded_name},
+            "_meta": {"title": f"参考图片 {index + 1}"},
+        }
+        sampler[f"ref_images.ref_image_{index}"] = [node_id, 0]
+    return workflow
+
+
+def try_cancel_comfy(prompt_id: str | None) -> None:
+    if not prompt_id:
         return
     try:
-        http_json("DELETE", f"{ENGINE_URL}/v1/videos/{engine_job_id}", timeout=10)
+        http_json("POST", f"{COMFYUI_URL}/queue", {"delete": [prompt_id]}, timeout=10)
+    except Exception:
+        pass
+    try:
+        http_json("POST", f"{COMFYUI_URL}/interrupt", {}, timeout=10)
     except Exception:
         pass
 
 
-def download_output(engine_job_id: str, destination: Path) -> None:
-    req = urllib.request.Request(f"{ENGINE_URL}/v1/videos/{engine_job_id}/content")
+def comfy_history_output(record: dict[str, Any]) -> dict[str, str]:
+    status = record.get("status") or {}
+    if status.get("status_str") == "error":
+        messages = [item[1] for item in status.get("messages", []) if item and item[0] == "execution_error"]
+        raise RuntimeError(f"ComfyUI 生成失败：{messages[-1] if messages else status}")
+    node_output = (record.get("outputs") or {}).get("92") or {}
+    for field in ("images", "videos", "gifs"):
+        entries = node_output.get(field) or []
+        if entries:
+            return entries[0]
+    raise RuntimeError("ComfyUI 已结束，但没有返回 SaveVideo 输出")
+
+
+def download_comfy_output(output: dict[str, str], destination: Path) -> None:
+    filename = Path(output.get("filename", "")).name
+    subfolder = Path(output.get("subfolder", ""))
+    source = (COMFYUI_OUTPUT_DIR / subfolder / filename).resolve()
+    output_root = COMFYUI_OUTPUT_DIR.resolve()
+    if source.is_file() and (source == output_root or output_root in source.parents):
+        shutil.copy2(source, destination)
+        source.unlink(missing_ok=True)
+        return
+    query = urlencode({
+        "filename": filename, "subfolder": output.get("subfolder", ""),
+        "type": output.get("type", "output"),
+    })
+    req = urllib.request.Request(f"{COMFYUI_URL}/view?{query}")
     try:
         with urllib.request.urlopen(req, timeout=900) as response, destination.open("wb") as target:
             shutil.copyfileobj(response, target, length=1024 * 1024)
@@ -336,45 +534,62 @@ def mark_task(task_id: str, **values: Any) -> None:
 
 def process_task(row: sqlite3.Row) -> None:
     task_id = row["id"]
-    engine_job_id: str | None = None
+    prompt_id: str | None = None
+    comfy_input_folder: Path | None = None
     try:
-        submitted = http_json("POST", f"{ENGINE_URL}/v1/videos", build_engine_payload(row), timeout=120)
-        engine_job_id = str(submitted.get("id") or "")
-        if not engine_job_id:
-            raise RuntimeError(f"H3 服务未返回任务 ID: {submitted}")
-        mark_task(task_id, status="running", progress=15, engine_job_id=engine_job_id)
+        source_upload, reference_uploads, comfy_input_folder = prepare_comfy_inputs(row)
+        workflow = build_comfy_workflow(row, source_upload, reference_uploads)
+        submitted = http_json(
+            "POST", f"{COMFYUI_URL}/prompt",
+            {"prompt": workflow, "client_id": f"h3-studio-{task_id}"}, timeout=120,
+        )
+        prompt_id = str(submitted.get("prompt_id") or "")
+        if not prompt_id:
+            raise RuntimeError(f"ComfyUI 未返回 prompt_id：{submitted}")
+        mark_task(task_id, status="running", progress=15, engine_job_id=prompt_id)
 
         started = time.monotonic()
+        history_record: dict[str, Any] | None = None
         while not worker_stop.is_set():
             control = get_control_state(task_id)
             if control is None or control["cancel_requested"] or control["deleted_at"]:
-                try_cancel_engine(engine_job_id)
+                try_cancel_comfy(prompt_id)
                 if control is not None and not control["deleted_at"]:
                     mark_task(task_id, status="cancelled", progress=0, finished_at=utcnow())
                 return
-            remote = http_json("GET", f"{ENGINE_URL}/v1/videos/{engine_job_id}", timeout=30)
-            status = str(remote.get("status", "")).lower()
-            if status in {"completed", "succeeded"}:
+            history = http_json("GET", f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
+            history_record = history.get(prompt_id)
+            if history_record is not None:
                 break
-            if status in {"failed", "error", "cancelled", "canceled"}:
-                message = remote.get("error") or remote.get("message") or json.dumps(remote, ensure_ascii=False)
-                raise RuntimeError(f"H3 生成失败: {message}")
             elapsed = time.monotonic() - started
+            if elapsed > COMFYUI_TIMEOUT:
+                try_cancel_comfy(prompt_id)
+                raise TimeoutError(f"ComfyUI 生成超过 {COMFYUI_TIMEOUT} 秒")
             progress = min(92, 18 + int(elapsed / 15))
             mark_task(task_id, progress=progress)
             worker_stop.wait(POLL_SECONDS)
         if worker_stop.is_set():
+            try_cancel_comfy(prompt_id)
             return
+        if history_record is None:
+            raise RuntimeError("ComfyUI 未返回任务结果")
 
         destination = OUTPUT_DIR / f"{task_id}.mp4"
         mark_task(task_id, progress=95)
-        download_output(engine_job_id, destination)
+        download_comfy_output(comfy_history_output(history_record), destination)
+        try:
+            http_json("POST", f"{COMFYUI_URL}/history", {"delete": [prompt_id]}, timeout=10)
+        except Exception:
+            pass
         mark_task(
             task_id, status="completed", progress=100, output_path=str(destination),
             finished_at=utcnow(), error=None,
         )
     except Exception as exc:
         mark_task(task_id, status="failed", progress=0, error=str(exc)[:4000], finished_at=utcnow())
+    finally:
+        if comfy_input_folder is not None:
+            shutil.rmtree(comfy_input_folder, ignore_errors=True)
 
 
 def worker_loop() -> None:
@@ -399,71 +614,86 @@ async def lifespan(_: FastAPI):
         worker_thread.join(timeout=5)
 
 
-app = FastAPI(title="MiniMax H3 Video Studio", version="1.0.0", lifespan=lifespan)
-
-
-@app.middleware("http")
-async def api_auth(request: Request, call_next):
-    if request.url.path.startswith("/api/") and request.url.path not in {"/api/config"}:
-        if not is_authorized(request.headers.get("authorization"), request.headers.get("x-api-key")):
-            return JSONResponse({"detail": "访问令牌无效"}, status_code=401)
-    return await call_next(request)
+app = FastAPI(title="MiniMax H3 Video Studio", version="2.0.0", lifespan=lifespan)
 
 
 @app.get("/api/config")
 def config() -> dict[str, Any]:
-    return {"auth_required": bool(API_TOKEN), "max_upload_gb": MAX_UPLOAD_GB}
+    return {"max_upload_gb": MAX_UPLOAD_GB, "engine": "comfyui"}
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     engine_ok = False
     try:
-        req = urllib.request.Request(f"{ENGINE_URL}/health")
+        req = urllib.request.Request(f"{COMFYUI_URL}/system_stats")
         with urllib.request.urlopen(req, timeout=2) as response:
             engine_ok = response.status < 500
     except Exception:
         pass
-    return {"app": "ok", "engine": "ok" if engine_ok else "unavailable", "engine_url": ENGINE_URL}
+    return {
+        "app": "ok", "engine": "ok" if engine_ok else "unavailable",
+        "engine_name": "ComfyUI", "engine_url": COMFYUI_URL,
+    }
 
 
 @app.post("/api/tasks", status_code=201)
 async def create_manual_task(
-    source_video: Annotated[UploadFile, File(...)],
-    character_image: Annotated[UploadFile | None, File()] = None,
-    product_image: Annotated[UploadFile | None, File()] = None,
-    name: Annotated[str, Form()] = "",
+    upload_videos: Annotated[list[UploadFile], File(...)],
+    reference_images: Annotated[list[UploadFile], File()] = [],
     prompt: Annotated[str, Form()] = "",
-    duration: Annotated[int, Form()] = 5,
-    aspect_ratio: Annotated[str, Form()] = "16:9",
-    source_start: Annotated[float, Form()] = 0,
+    aspect_ratio: Annotated[str, Form()] = "auto",
     seed: Annotated[int | None, Form()] = None,
+    video_durations: Annotated[str, Form()] = "[]",
 ) -> dict[str, Any]:
-    validate_task_values(duration, aspect_ratio, source_start)
-    task_folder = UPLOAD_DIR / uuid.uuid4().hex
+    if not upload_videos or not any(item.filename for item in upload_videos):
+        raise HTTPException(400, "请至少上传一个视频")
+    if len([item for item in upload_videos if item.filename]) > 3:
+        raise HTTPException(400, "一次最多上传 3 个视频")
+    if len([item for item in reference_images if item.filename]) > 9:
+        raise HTTPException(400, "参考图片最多上传 9 张")
     try:
-        source = await save_upload(
-            source_video, task_folder / ("source_" + safe_name(source_video.filename or "source.mp4")), VIDEO_EXTENSIONS, "源视频"
-        )
-        character = None
-        product = None
-        if character_image and character_image.filename:
-            character = await save_upload(
-                character_image, task_folder / ("character_" + safe_name(character_image.filename)), IMAGE_EXTENSIONS, "人物参考图"
+        hints_raw = json.loads(video_durations)
+        duration_hints = [float(value) for value in hints_raw] if isinstance(hints_raw, list) else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        duration_hints = []
+    task_folder = UPLOAD_DIR / uuid.uuid4().hex
+    created: list[str] = []
+    try:
+        saved_references: list[Path] = []
+        for index, image in enumerate(reference_images, start=1):
+            if image.filename:
+                saved_references.append(await save_upload(
+                    image, task_folder / f"ref_{index:02d}_{safe_name(image.filename)}", IMAGE_EXTENSIONS, "参考图片"
+                ))
+
+        prepared: list[tuple[Path, str, float]] = []
+        for index, video in enumerate(upload_videos, start=1):
+            if not video.filename:
+                continue
+            original_name = Path(video.filename).name
+            saved_video = await save_upload(
+                video, task_folder / f"video_{index:03d}_{safe_name(original_name)}", VIDEO_EXTENSIONS, "上传视频"
             )
-        if product_image and product_image.filename:
-            product = await save_upload(
-                product_image, task_folder / ("product_" + safe_name(product_image.filename)), IMAGE_EXTENSIONS, "商品参考图"
-            )
-        task_id = insert_task(
-            name=name, prompt=prompt, source_video=source, character_image=character,
-            product_image=product, duration=duration, aspect_ratio=aspect_ratio,
-            source_start=source_start, seed=seed,
-        )
-        return {"id": task_id, "status": "queued"}
-    except Exception:
-        shutil.rmtree(task_folder, ignore_errors=True)
+            hint = duration_hints[index - 1] if index - 1 < len(duration_hints) else None
+            duration = probe_video_duration(saved_video, hint)
+            prepared.append((saved_video, original_name, duration))
+
+        validate_task_values(prepared[0][2], aspect_ratio)
+        for saved_video, original_name, duration in prepared:
+            created.append(insert_task(
+                prompt=prompt, source_video=saved_video, reference_images=saved_references,
+                duration=duration, aspect_ratio=aspect_ratio, seed=seed, display_name=original_name,
+            ))
+        return {"created": len(created), "task_ids": created, "status": "queued"}
+    except HTTPException:
+        if not created:
+            shutil.rmtree(task_folder, ignore_errors=True)
         raise
+    except Exception as exc:
+        if not created:
+            shutil.rmtree(task_folder, ignore_errors=True)
+        raise HTTPException(400, str(exc)) from exc
 
 
 def text_cell(value: Any) -> str:
@@ -478,36 +708,11 @@ def int_cell(value: Any, default: int | None = None) -> int | None:
     return int(float(value))
 
 
-def float_cell(value: Any, default: float = 0) -> float:
-    if value is None or str(value).strip() == "":
-        return default
-    return float(value)
-
-
-def resolve_excel_asset(value: str, uploaded: dict[str, Path]) -> Path | None:
-    value = value.strip()
-    if not value:
-        return None
-    basename = Path(value).name.lower()
-    if basename in uploaded:
-        return uploaded[basename]
-    if SERVER_ASSET_ROOT:
-        root = Path(SERVER_ASSET_ROOT).resolve()
-        candidate = (root / value).resolve() if not Path(value).is_absolute() else Path(value).resolve()
-        if candidate.is_file() and (candidate == root or root in candidate.parents):
-            return candidate
-    raise ValueError(f"找不到素材“{value}”，请同时选择并上传该文件")
-
-
 @app.post("/api/tasks/import", status_code=201)
 async def import_excel_tasks(
     excel: Annotated[UploadFile, File(...)],
-    media: Annotated[list[UploadFile], File()] = [],
 ) -> dict[str, Any]:
     validate_extension(excel.filename or "", EXCEL_EXTENSIONS, "Excel")
-    batch_folder = UPLOAD_DIR / f"batch-{uuid.uuid4().hex}"
-    batch_folder.mkdir(parents=True, exist_ok=True)
-    uploaded: dict[str, Path] = {}
     created: list[str] = []
     errors: list[dict[str, Any]] = []
     try:
@@ -515,14 +720,6 @@ async def import_excel_tasks(
         if len(excel_bytes) > 50 * 1024 * 1024:
             raise HTTPException(413, "Excel 文件不能超过 50 MB")
         await excel.close()
-        for item in media:
-            if not item.filename:
-                continue
-            key = Path(item.filename).name.lower()
-            if key in uploaded:
-                raise HTTPException(400, f"素材文件名重复：{item.filename}")
-            allowed = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
-            uploaded[key] = await save_upload(item, batch_folder / safe_name(item.filename), allowed, "素材")
 
         workbook = load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
         if "任务" not in workbook.sheetnames:
@@ -530,44 +727,41 @@ async def import_excel_tasks(
         sheet = workbook["任务"]
         rows = sheet.iter_rows(values_only=True)
         headers = [text_cell(value) for value in next(rows, [])]
-        required = {"source_video"}
+        required = {"upload_video_url"}
         if not required.issubset(headers):
-            raise HTTPException(400, "Excel 缺少必填列：source_video")
+            raise HTTPException(400, "Excel 缺少必填列：upload_video_url")
         index = {name: position for position, name in enumerate(headers) if name}
+        data_rows = [values for values in rows if any(value is not None and str(value).strip() for value in values)]
+        if len(data_rows) > 3:
+            raise HTTPException(400, "一次最多导入 3 条视频任务")
 
-        for excel_row, values in enumerate(rows, start=2):
-            if not any(value is not None and str(value).strip() for value in values):
-                continue
+        for excel_row, values in enumerate(data_rows, start=2):
             def cell(column: str) -> Any:
                 position = index.get(column)
                 return values[position] if position is not None and position < len(values) else None
             try:
-                source = resolve_excel_asset(text_cell(cell("source_video")), uploaded)
-                if source is None:
-                    raise ValueError("source_video 不能为空")
-                character = resolve_excel_asset(text_cell(cell("character_image")), uploaded)
-                product = resolve_excel_asset(text_cell(cell("product_image")), uploaded)
-                duration = int_cell(cell("duration"), 5) or 5
-                aspect_ratio = text_cell(cell("aspect_ratio")) or "16:9"
-                source_start = float_cell(cell("source_start"), 0)
+                source_url = validate_public_media_url(text_cell(cell("upload_video_url")), "upload_video_url")
+                reference_urls = [
+                    validate_public_media_url(item.strip(), "reference_image_url")
+                    for item in re.split(r"[,，;；\n]+", text_cell(cell("reference_image_urls"))) if item.strip()
+                ]
+                if len(reference_urls) > 9:
+                    raise ValueError("reference_image_urls 最多填写 9 个图片 URL")
+                duration = probe_video_duration(source_url)
+                aspect_ratio = text_cell(cell("aspect_ratio")) or "auto"
                 seed = int_cell(cell("seed"), None)
                 task_id = insert_task(
-                    name=text_cell(cell("task_name")) or f"Excel 第 {excel_row} 行",
-                    prompt=text_cell(cell("prompt")), source_video=source,
-                    character_image=character, product_image=product, duration=duration,
-                    aspect_ratio=aspect_ratio, source_start=source_start, seed=seed,
+                    prompt=text_cell(cell("prompt")), source_video=source_url,
+                    reference_images=reference_urls, duration=duration, aspect_ratio=aspect_ratio,
+                    seed=seed, display_name=media_display_name(source_url),
                 )
                 created.append(task_id)
             except Exception as exc:
                 errors.append({"row": excel_row, "error": str(exc)})
-        if not created and errors:
-            shutil.rmtree(batch_folder, ignore_errors=True)
         return {"created": len(created), "task_ids": created, "errors": errors}
     except HTTPException:
-        shutil.rmtree(batch_folder, ignore_errors=True)
         raise
     except Exception as exc:
-        shutil.rmtree(batch_folder, ignore_errors=True)
         raise HTTPException(400, f"Excel 导入失败：{exc}") from exc
 
 
@@ -594,7 +788,7 @@ def delete_task(task_id: str) -> dict[str, Any]:
             (now, now, task_id),
         )
     if row["status"] in {"starting", "running"}:
-        try_cancel_engine(row["engine_job_id"])
+        try_cancel_comfy(row["engine_job_id"])
     if row["output_path"]:
         Path(row["output_path"]).unlink(missing_ok=True)
     return {"deleted": True, "was_running": row["status"] in {"starting", "running"}}
@@ -635,14 +829,12 @@ def excel_template() -> StreamingResponse:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "任务"
-    headers = [
-        "task_name", "source_video", "character_image", "product_image", "prompt",
-        "duration", "aspect_ratio", "source_start", "seed",
-    ]
+    headers = ["upload_video_url", "reference_image_urls", "prompt", "aspect_ratio", "seed"]
     sheet.append(headers)
     sheet.append([
-        "示例-人物和商品替换", "source.mp4", "person.jpg", "product.png",
-        "保持原视频场景和运镜，人物自然拿着新商品，包装文字尽量清晰。", 5, "16:9", 0, "",
+        "https://your-domain.example/videos/source.mp4",
+        "https://your-domain.example/images/person.jpg\nhttps://your-domain.example/images/product.png",
+        "保持上传视频的场景和运镜，用参考图片替换人物和商品，包装文字尽量清晰。", "auto", "",
     ])
     header_fill = PatternFill("solid", fgColor="253449")
     for cell in sheet[1]:
@@ -651,33 +843,26 @@ def excel_template() -> StreamingResponse:
         cell.alignment = Alignment(horizontal="center")
     for cell in sheet[2]:
         cell.fill = PatternFill("solid", fgColor="FFF4CC")
-    widths = [24, 24, 24, 24, 62, 12, 16, 16, 16]
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+    sheet.row_dimensions[2].height = 38
+    widths = [52, 62, 72, 18, 18]
     for i, width in enumerate(widths, start=1):
         sheet.column_dimensions[chr(64 + i)].width = width
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:I2"
-    sheet["B1"].comment = Comment("必填；填写同时上传的视频文件名。", "MiniMax H3 Studio")
-    sheet["C1"].comment = Comment("可选；人物正面清晰参考图文件名。", "MiniMax H3 Studio")
-    sheet["D1"].comment = Comment("可选；商品清晰参考图文件名。", "MiniMax H3 Studio")
-    sheet["F1"].comment = Comment("4–15 秒。", "MiniMax H3 Studio")
+    sheet.auto_filter.ref = "A1:E2"
+    sheet["A1"].comment = Comment("必填；用户自行提供可公开访问的视频 URL。视频时长必须为 4–15 秒。", "MiniMax H3 Studio")
+    sheet["B1"].comment = Comment("可选；用户自行提供人物或商品图片 URL，每行一个，最多 9 个。", "MiniMax H3 Studio")
     ratio_validation = DataValidation(type="list", formula1='"auto,16:9,9:16,1:1,4:3,3:4,21:9"')
-    duration_validation = DataValidation(type="whole", operator="between", formula1="4", formula2="15")
     sheet.add_data_validation(ratio_validation)
-    sheet.add_data_validation(duration_validation)
-    ratio_validation.add("G2:G1000")
-    duration_validation.add("F2:F1000")
+    ratio_validation.add("D2:D1000")
 
     guide = workbook.create_sheet("字段说明")
     guide.append(["字段", "是否必填", "说明"])
     guide_rows = [
-        ("task_name", "否", "任务名称；空白时自动生成。"),
-        ("source_video", "是", "源视频文件名；需在导入时同时选择上传。"),
-        ("character_image", "否", "替换人物的参考图片文件名。"),
-        ("product_image", "否", "替换商品的参考图片文件名。"),
-        ("prompt", "否", "补充要求，例如服装、环境、动作或保留项。"),
-        ("duration", "否", "输出 4–15 秒，默认 5 秒。"),
-        ("aspect_ratio", "否", "默认 16:9；可使用 auto。"),
-        ("source_start", "否", "从源视频第几秒开始读取，默认 0。"),
+        ("upload_video_url", "是", "用户自行提供可公开访问的视频 URL。服务端自动读取时长，必须为 4–15 秒。"),
+        ("reference_image_urls", "否", "用户自行提供人物和商品参考图片 URL；每行一个，最多 9 个。"),
+        ("prompt", "否", "说明每张参考图片用于替换人物还是商品，并填写其他保留要求。"),
+        ("aspect_ratio", "否", "默认 auto，跟随上传视频比例；也可指定固定比例。"),
         ("seed", "否", "固定随机种子便于复现；空白时自动生成。"),
     ]
     for row in guide_rows:

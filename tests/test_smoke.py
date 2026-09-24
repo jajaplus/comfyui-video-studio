@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -18,6 +19,8 @@ class StudioSmokeTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.temp = tempfile.TemporaryDirectory()
         os.environ["H3_STUDIO_DATA_DIR"] = cls.temp.name
+        os.environ["H3_COMFYUI_INPUT_DIR"] = str(Path(cls.temp.name) / "comfyui" / "input")
+        os.environ["H3_COMFYUI_OUTPUT_DIR"] = str(Path(cls.temp.name) / "comfyui" / "output")
         import app.main
         cls.main = importlib.reload(app.main)
         cls.main.init_db()
@@ -37,9 +40,9 @@ class StudioSmokeTest(unittest.TestCase):
         product.write_bytes(b"image")
 
         task_id = self.main.insert_task(
-            name="smoke", prompt="Keep the original background.", source_video=source,
-            character_image=person, product_image=product, duration=5,
-            aspect_ratio="16:9", source_start=0, seed=42,
+            prompt="Keep the original background.", source_video=source,
+            reference_images=[person, product], duration=5.25,
+            aspect_ratio="16:9", seed=42, display_name="smoke.mp4",
         )
         row = self.main.claim_next_task()
         self.assertEqual(row["id"], task_id)
@@ -49,17 +52,27 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertIn("<Picture 2>", prompt)
 
         def fake_http(method, url, payload=None, timeout=60):
-            if method == "POST":
-                self.assertEqual(payload["task"], "ref2va")
-                self.assertEqual(len(payload["conditions"]), 3)
-                return {"id": "engine-1"}
-            return {"status": "completed"}
+            if url.endswith("/prompt"):
+                workflow = payload["prompt"]
+                sampler = workflow["136"]["inputs"]
+                self.assertIn("ref_videos.ref_video_0", sampler)
+                self.assertIn("ref_images.ref_image_0", sampler)
+                self.assertIn("ref_images.ref_image_1", sampler)
+                return {"prompt_id": "comfy-1"}
+            if "/history/comfy-1" in url:
+                return {"comfy-1": {
+                    "status": {"status_str": "success"},
+                    "outputs": {"92": {"images": [{
+                        "filename": "result.mp4", "subfolder": "h3_studio", "type": "output"
+                    }]}},
+                }}
+            return {}
 
         def fake_download(_, destination):
             destination.write_bytes(b"fake-mp4")
 
         with patch.object(self.main, "http_json", side_effect=fake_http), patch.object(
-            self.main, "download_output", side_effect=fake_download
+            self.main, "download_comfy_output", side_effect=fake_download
         ):
             self.main.process_task(row)
 
@@ -75,21 +88,19 @@ class StudioSmokeTest(unittest.TestCase):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "任务"
+        sheet.append(["upload_video_url", "reference_image_urls", "prompt", "aspect_ratio", "seed"])
         sheet.append([
-            "task_name", "source_video", "character_image", "product_image", "prompt",
-            "duration", "aspect_ratio", "source_start", "seed",
+            "https://media.example.com/bulk.mp4",
+            "https://media.example.com/face.jpg",
+            "自然光", "9:16", 99,
         ])
-        sheet.append(["bulk", "bulk.mp4", "face.jpg", "", "自然光", 4, "9:16", 1.5, 99])
         excel_data = io.BytesIO()
         workbook.save(excel_data)
         excel_data.seek(0)
 
         excel = UploadFile(filename="tasks.xlsx", file=excel_data)
-        media = [
-            UploadFile(filename="bulk.mp4", file=io.BytesIO(b"video")),
-            UploadFile(filename="face.jpg", file=io.BytesIO(b"image")),
-        ]
-        result = asyncio.run(self.main.import_excel_tasks(excel=excel, media=media))
+        with patch.object(self.main, "probe_video_duration", return_value=4.5):
+            result = asyncio.run(self.main.import_excel_tasks(excel=excel))
         self.assertEqual(result["created"], 1)
         self.assertEqual(result["errors"], [])
 
@@ -104,8 +115,36 @@ class StudioSmokeTest(unittest.TestCase):
         template_bytes = asyncio.run(consume())
         template = load_workbook(io.BytesIO(template_bytes))
         self.assertEqual(template.sheetnames, ["任务", "字段说明"])
-        self.assertEqual(template["任务"]["B1"].value, "source_video")
+        self.assertEqual(template["任务"]["A1"].value, "upload_video_url")
+        self.assertEqual(template["任务"]["B1"].value, "reference_image_urls")
         self.assertGreater(len(template["任务"].data_validations.dataValidation), 0)
+
+    def test_03_manual_multiple_videos(self) -> None:
+        videos = [
+            UploadFile(filename="one.mp4", file=io.BytesIO(b"video-one")),
+            UploadFile(filename="two.mov", file=io.BytesIO(b"video-two")),
+        ]
+        references = [
+            UploadFile(filename="person.jpg", file=io.BytesIO(b"person")),
+            UploadFile(filename="product.png", file=io.BytesIO(b"product")),
+        ]
+        result = asyncio.run(self.main.create_manual_task(
+            upload_videos=videos,
+            reference_images=references,
+            prompt="Picture 1 is the person. Picture 2 is the product.",
+            aspect_ratio="16:9",
+            seed=None,
+            video_durations="[5.2, 8.4]",
+        ))
+        self.assertEqual(result["created"], 2)
+        with self.main.connect_db() as conn:
+            rows = conn.execute(
+                "SELECT name,duration,reference_images FROM tasks WHERE id IN (?,?) ORDER BY name",
+                result["task_ids"],
+            ).fetchall()
+        self.assertEqual([row["name"] for row in rows], ["one", "two"])
+        self.assertEqual([row["duration"] for row in rows], [5.2, 8.4])
+        self.assertTrue(all(len(json.loads(row["reference_images"])) == 2 for row in rows))
 
 
 if __name__ == "__main__":

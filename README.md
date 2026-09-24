@@ -1,69 +1,88 @@
 # MiniMax H3 视频替换工作台
 
-这是一个可部署到 AutoDL 的单机应用：浏览器负责单任务或 Excel 批量上传，FastAPI 将任务持久化到 SQLite 并按顺序执行，SGLang 在本机运行 MiniMax-H3 Ref2VA。页面支持查看进度、下载结果、重试以及删除任务。
+这是一个部署在 AutoDL ComfyUI 实例上的 MiniMax-H3 Ref2VA 客户端。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序提交给本机 ComfyUI。网页不设置登录或访问令牌，访问地址后即可使用。
 
-## 能做什么
+## 功能
 
-- 使用源视频作为动作、镜头、场景和音频参考。
-- 使用人物图替换主要人物，使用商品图替换主要商品；两种参考可同时提供。
-- Excel 一次创建多个任务，并同时上传表格引用的视频和图片。
-- 任务在 SQLite 中持久化。网页刷新或应用重启后，未完成任务会重新排队。
-- 删除排队任务；删除生成中任务时会请求 SGLang 取消，并立即从列表隐藏。
-- 可设置访问令牌，适合通过 AutoDL 6006 自定义服务访问。
+- 视频和参考图片可多次点击、累计选择、预览和逐项删除。
+- 一次最多选择 3 个视频，每个视频建立一个独立队列任务。
+- 每个任务使用 1 个上传视频和最多 9 张人物或商品参考图。
+- 视频时长自动读取并显示，支持 4–15 秒。
+- 生成时长跟随上传视频，画面比例默认跟随视频方向。
+- Excel 一次最多导入 3 个任务，素材 URL 由用户自行填写。
+- SQLite 持久化队列，支持查看进度、下载、失败重试和删除任务。
+- 通过 ComfyUI 原生 `MiniMaxH3ReferenceToVideo` 工作流生成带声音的视频。
 
-MiniMax-H3 Ref2VA 是参考驱动的重生成模型。它可能重新组织动作与镜头，不能保证逐帧保留原视频，也不是传统意义上的像素级换脸或商品贴片。源素材应短而明确，建议先测试 4–5 秒。
+MiniMax-H3 Ref2VA 会重新生成画面与声音，不能保证逐帧复制原视频，也不是传统的像素级换脸或商品贴片。快速动作、遮挡、手部接触和包装小字可能发生变化。
 
-## AutoDL 机器选择
+## AutoDL 实例要求
 
-官方模型是 33B，并含 Qwen3-VL-32B 文本/视觉编码器。可按预算选择：
+创建实例时选择带有新版 ComfyUI 的应用镜像，ComfyUI 版本需要为 0.30.0 或更高。建议至少使用 24GB 显存 GPU，并准备足够的主机内存；显存和内存越小，生成越慢。
 
-| 配置 | 适用情况 | 说明 |
+本项目使用 AutoDL 公共模型，不需要重新下载完整的 Hugging Face 模型。需要在 AutoDL“公共模型”中搜索以下四个文件：
+
+| 类型 | 公共模型文件名 | ComfyUI 目录 |
 | --- | --- | --- |
-| 4 × H100 80GB | 稳定生产与较高吞吐 | 官方验证的常驻权重拓扑；本项目脚本使用 TP2 + Ulysses2。 |
-| 2 × RTX 5090 32GB，约 384GB 内存 | 较低成本、仍需较好速度 | 官方验证过双卡分层卸载。 |
-| 1 × RTX 4090/5090，24GB 以上显存，建议 192–256GB 内存 | 功能验证 | 使用 INT8 与 CPU 分层卸载，能跑但会明显慢，主机内存不足会失败。 |
+| Ref2VA 扩散模型 | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `models/diffusion_models` |
+| 文本编码器 | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `models/text_encoders` |
+| 视频 VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | `models/vae` |
+| 音频 VAE | `minimax_h3_audio_vae_fp32.safetensors` | `models/vae` |
 
-数据盘建议至少 350GB；模型缓存、上传源视频和生成结果都会占空间。选择 CUDA 12.4 或更新的 PyTorch 镜像。若 AutoDL 实例的内存较小，优先升级内存或改用多卡高显存机器。
+公共模型页面会给出一个以 `/.autodl/` 开头的源路径。应用通过软链接直接读取这些文件，不复制模型权重。
 
-## 部署
+## 上传项目
 
-将本项目上传到实例的数据盘，例如 `/root/autodl-tmp/comfyui-video-studio`，然后执行：
+可以通过 AutoDL JupyterLab 上传项目目录，也可以在 Mac 终端执行：
+
+```bash
+rsync -av --exclude '.venv' --exclude 'data' --exclude '.git' \
+  -e 'ssh -p 你的SSH端口' \
+  /Users/linyongjia/Desktop/comfyui-video-studio/ \
+  root@你的AutoDL主机:/root/autodl-tmp/comfyui-video-studio/
+```
+
+## 挂载公共模型
+
+从公共模型页面复制上述四个文件的源路径，然后在 AutoDL 终端执行：
 
 ```bash
 cd /root/autodl-tmp/comfyui-video-studio
 chmod +x scripts/*.sh
+
+scripts/link_autodl_models.sh \
+  '/.autodl/Ref2VA文件对应路径' \
+  '/.autodl/文本编码器对应路径' \
+  '/.autodl/视频VAE对应路径' \
+  '/.autodl/音频VAE对应路径'
+```
+
+脚本只创建软链接。如果 AutoDL 页面已经给出了 `ln -s` 命令，也可以直接执行页面提供的命令，但目标文件名和目录必须与上表一致。
+
+## 安装并启动
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
 scripts/install_autodl.sh
 cp .env.example .env
-```
-
-编辑 `.env`，至少修改 `H3_STUDIO_TOKEN`。建议使用随机长字符串：
-
-```bash
-python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-```
-
-启动模型与网页：
-
-```bash
 scripts/start_all.sh
 ```
 
-查看启动状态：
+查看日志：
 
 ```bash
-tail -f logs/h3.log
+tail -f logs/comfyui.log
 tail -f logs/app.log
 ```
 
-H3 首次启动会从 Hugging Face 下载模型。模型服务正常后，访问本机 `http://127.0.0.1:6006/health` 应看到 `engine: ok`。
-
-在 AutoDL 控制台打开“自定义服务”，选择 6006 端口对应的 HTTP 地址。个人账号无法直接开放端口时，可在自己的电脑上建立 SSH 隧道：
+检查状态：
 
 ```bash
-ssh -CNg -L 6006:127.0.0.1:6006 root@你的AutoDL主机 -p SSH端口
+curl http://127.0.0.1:6006/health
 ```
 
-然后打开 `http://127.0.0.1:6006`。
+返回 `engine: ok` 表示网页已连接 ComfyUI。网页监听 6006，ComfyUI 仅在服务器内部监听 8188，不需要开放 8188。
+
+在 AutoDL 控制台打开 6006 端口的“自定义服务”地址。访问者打开该地址即可上传素材和创建任务，不需要输入令牌。所有访问者共用同一个任务队列。
 
 停止服务：
 
@@ -71,35 +90,62 @@ ssh -CNg -L 6006:127.0.0.1:6006 root@你的AutoDL主机 -p SSH端口
 scripts/stop_all.sh
 ```
 
+## Mac 本地查看客户端
+
+不要直接双击 `static/index.html`，页面需要通过 FastAPI 打开。首次运行：
+
+```bash
+cd /Users/linyongjia/Desktop/comfyui-video-studio
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+启动网页预览：
+
+```bash
+cd /Users/linyongjia/Desktop/comfyui-video-studio
+H3_STUDIO_DATA_DIR="$PWD/data" \
+H3_COMFYUI_URL="http://127.0.0.1:8188" \
+.venv/bin/uvicorn app.main:app \
+  --host 127.0.0.1 \
+  --port 16006
+```
+
+另开一个终端：
+
+```bash
+open http://127.0.0.1:16006
+```
+
+Mac 没有运行 ComfyUI 时可以查看页面和预览素材，但不能生成视频。
+
+如果完整服务运行在 AutoDL，可通过 SSH 隧道访问：
+
+```bash
+ssh -CNg -L 6006:127.0.0.1:6006 root@你的AutoDL主机 -p SSH端口
+open http://127.0.0.1:6006
+```
+
 ## Excel 批量格式
 
-在页面点击“下载 Excel 模板”。`任务`工作表每行一个任务，字段如下：
+在网页中点击“下载 Excel 模板”。`任务`工作表每行一个任务：
 
 | 列 | 必填 | 含义 |
 | --- | --- | --- |
-| `task_name` | 否 | 任务名称 |
-| `source_video` | 是 | 源视频文件名 |
-| `character_image` | 否 | 人物参考图文件名 |
-| `product_image` | 否 | 商品参考图文件名 |
-| `prompt` | 否 | 补充生成要求 |
-| `duration` | 否 | 4–15 秒，默认 5 |
+| `upload_video_url` | 是 | 用户自行提供的公开视频 URL，时长必须为 4–15 秒 |
+| `reference_image_urls` | 否 | 用户自行提供的参考图片 URL，每行一个，最多 9 个 |
+| `prompt` | 否 | 视频生成提示词 |
 | `aspect_ratio` | 否 | `auto`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 或 `21:9` |
-| `source_start` | 否 | 从源视频第几秒开始，默认 0 |
-| `seed` | 否 | 固定随机种子；空白时自动生成 |
+| `seed` | 否 | 随机种子，留空时自动生成 |
 
-导入时同时选择表格中提到的素材文件，服务端按文件名匹配。文件名不能重复。若素材已提前放到服务器，可在 `.env` 设置 `H3_SERVER_ASSET_ROOT`，Excel 则可引用该目录内的相对路径。
+URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接访问。临时过期、需要登录或禁止外链的 URL 无法使用。
 
-## 接口与数据
+## 目录与端口
 
-- 网页和 API：6006
-- SGLang Ref2VA：仅监听 `127.0.0.1:30011`
-- 数据目录：`H3_STUDIO_DATA_DIR`
+- 客户端和任务 API：`6006`
+- ComfyUI 内部接口：`127.0.0.1:8188`
 - 队列数据库：`$H3_STUDIO_DATA_DIR/studio.db`
-- 成片：`$H3_STUDIO_DATA_DIR/outputs`
+- 生成结果：`$H3_STUDIO_DATA_DIR/outputs`
+- ComfyUI 工作流：`workflows/minimax_h3_ref2va_api.json`
 
-应用只启动一个队列 worker。请保持 Uvicorn 的 `--workers 1`，否则多进程会同时抢占同一 GPU。任务删除使用软删除记录，输出文件会删除；原始上传素材暂时保留，便于数据库审计和批量任务共享。可按需要定期清理已删除任务对应的上传目录。
-
-## 使用要求
-
-部署和商用前请阅读 MiniMax-H3 Community License。只处理你有权使用的人物、商品、音频和视频素材，并取得人物肖像及品牌素材的必要授权。AutoDL 自定义服务条款将其定位为科研用途，并要求链接仅供账户本人使用；若用于面向客户的正式产品，应选择允许相应用途的云部署方案。
-
+应用保持一个队列 worker，Uvicorn 必须使用 `--workers 1`。任务素材提交给 ComfyUI 后会从 ComfyUI input 临时目录清理，原始上传文件仍保留在工作台数据目录中，以便失败后重试。

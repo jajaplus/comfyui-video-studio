@@ -58,7 +58,18 @@ input:focus, textarea:focus, select:focus { border-color: rgba(120, 230, 197, .6
 input[type=file] { padding: 10px; color: var(--muted); }
 input[type=file]::file-selector-button { color: #092019; background: var(--mint); border: 0; border-radius: 8px; padding: 8px 11px; margin-right: 10px; font-weight: 800; cursor: pointer; }
 .file-field p, .bulk-intro p { margin: -2px 0 0; color: var(--muted); font-weight: 400; line-height: 1.5; }
-.required > label::after { content: " *"; color: var(--amber); }
+.media-preview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.media-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: #091620; }
+.media-card video, .media-card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #03080c; }
+.media-card img { object-fit: cover; }
+.media-info { padding: 9px 10px; }
+.media-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.media-info span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.media-info span.invalid { color: var(--red); }
+.media-remove { position: absolute; top: 7px; right: 7px; z-index: 2; width: 28px; height: 28px; padding: 0; border: 1px solid rgba(255,255,255,.24); border-radius: 50%; color: #fff; background: rgba(5,12,17,.78); cursor: pointer; font-size: 18px; line-height: 1; }
+.media-remove:hover { color: var(--red); border-color: rgba(255,131,125,.55); }
+.file-label { display: inline-flex; width: max-content; align-items: center; gap: 3px; white-space: nowrap; }
+.required > .file-label::after { content: "*"; color: var(--amber); }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .three-col { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 12px; }
 details { border-top: 1px solid var(--line); padding-top: 14px; }
@@ -111,9 +122,9 @@ dialog p { color: var(--muted); font-size: 13px; }
   .topbar { flex-direction: column; }
   .stats { grid-template-columns: 1fr 1fr; }
   .two-col, .three-col { grid-template-columns: 1fr; }
+  .media-preview { grid-template-columns: 1fr; }
   .task { grid-template-columns: 1fr; }
   .task-actions { justify-content: flex-end; }
   .notice { display: block; }
   .notice b { display: block; margin-bottom: 5px; }
 }
-

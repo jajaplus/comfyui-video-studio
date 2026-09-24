@@ -1,8 +1,9 @@
 const state = {
-  token: localStorage.getItem('h3_token') || '',
   tasks: [],
-  authRequired: false,
+  selectedVideos: [],
+  selectedImages: [],
 };
+const videoDurationCache = new WeakMap();
 
 const $ = (selector) => document.querySelector(selector);
 const statusLabels = {
@@ -10,16 +11,8 @@ const statusLabels = {
   completed: '已完成', failed: '失败', cancelled: '已取消',
 };
 
-function authHeaders(extra = {}) {
-  return state.token ? { ...extra, Authorization: `Bearer ${state.token}` } : extra;
-}
-
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
-  if (response.status === 401) {
-    $('#tokenDialog').showModal();
-    throw new Error('请填写正确的访问令牌');
-  }
+  const response = await fetch(path, options);
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     try { message = (await response.json()).detail || message; } catch (_) {}
@@ -47,6 +40,125 @@ function formatTime(value) {
   if (!value) return '';
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? '' : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatSeconds(value) {
+  const number = Number(value || 0);
+  return Number.isInteger(number) ? `${number}` : number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function isVideo(file) {
+  return file.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi)$/i.test(file.name);
+}
+
+function readVideoDuration(file) {
+  if (videoDurationCache.has(file)) return Promise.resolve(videoDurationCache.get(file));
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    const url = URL.createObjectURL(file);
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      const duration = Number(video.duration.toFixed(3));
+      videoDurationCache.set(file, duration);
+      URL.revokeObjectURL(url);
+      resolve(duration);
+    };
+    video.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`无法读取视频时长：${file.name}`));
+    };
+    video.src = url;
+  });
+}
+
+function clearMediaPreview(container) {
+  for (const url of container._objectUrls || []) URL.revokeObjectURL(url);
+  container._objectUrls = [];
+  container.innerHTML = '';
+  container.classList.add('hidden');
+}
+
+function fileKey(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function syncFileInput(input, files) {
+  const transfer = new DataTransfer();
+  for (const file of files) transfer.items.add(file);
+  input.files = transfer.files;
+}
+
+function renderMediaPreview(files, container, kind) {
+  clearMediaPreview(container);
+  if (!files.length) return;
+  container.classList.remove('hidden');
+  for (const file of files) {
+    const card = document.createElement('article');
+    card.className = 'media-card';
+    const url = URL.createObjectURL(file);
+    container._objectUrls.push(url);
+    const media = document.createElement(isVideo(file) ? 'video' : 'img');
+    media.src = url;
+    if (isVideo(file)) {
+      media.controls = true;
+      media.preload = 'metadata';
+      media.muted = true;
+    } else {
+      media.alt = file.name;
+    }
+    const info = document.createElement('div');
+    info.className = 'media-info';
+    const name = document.createElement('strong');
+    name.textContent = file.name;
+    const meta = document.createElement('span');
+    meta.textContent = isVideo(file) ? '正在读取时长…' : `${(file.size / 1024 / 1024).toFixed(1)} MB`;
+    info.append(name, meta);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'media-remove';
+    remove.title = `删除 ${file.name}`;
+    remove.setAttribute('aria-label', `删除 ${file.name}`);
+    remove.textContent = '×';
+    remove.addEventListener('click', () => {
+      const stateKey = kind === 'video' ? 'selectedVideos' : 'selectedImages';
+      const input = kind === 'video' ? $('#uploadVideos') : $('#referenceImages');
+      state[stateKey] = state[stateKey].filter((item) => fileKey(item) !== fileKey(file));
+      syncFileInput(input, state[stateKey]);
+      renderMediaPreview(state[stateKey], container, kind);
+    });
+    card.append(media, info, remove);
+    container.append(card);
+    if (isVideo(file)) {
+      readVideoDuration(file).then((duration) => {
+        meta.textContent = `${formatSeconds(duration)} 秒`;
+        if (duration < 4 || duration > 15) {
+          meta.className = 'invalid';
+          meta.textContent += ' · 超出 H3 的 4–15 秒限制';
+        }
+      }).catch((error) => {
+        meta.className = 'invalid';
+        meta.textContent = error.message;
+      });
+    }
+  }
+}
+
+function appendSelectedFiles(kind, input, newFiles, maxFiles, container) {
+  const stateKey = kind === 'video' ? 'selectedVideos' : 'selectedImages';
+  const merged = [...state[stateKey]];
+  const known = new Set(merged.map(fileKey));
+  for (const file of newFiles) {
+    if (!known.has(fileKey(file)) && merged.length < maxFiles) {
+      merged.push(file);
+      known.add(fileKey(file));
+    }
+  }
+  if (newFiles.length && merged.length >= maxFiles && new Set([...state[stateKey], ...newFiles].map(fileKey)).size > maxFiles) {
+    toast(`${kind === 'video' ? '上传视频' : '参考图片'}最多选择 ${maxFiles} 个`);
+  }
+  state[stateKey] = merged;
+  syncFileInput(input, merged);
+  renderMediaPreview(merged, container, kind);
 }
 
 function renderTasks() {
@@ -82,7 +194,7 @@ function renderTasks() {
           <span class="badge ${escapeHtml(task.status)}">${escapeHtml(status)}</span>
         </div>
         <div class="task-meta">
-          ${queue}<span>${task.duration} 秒 · ${escapeHtml(task.aspect_ratio)}</span>
+          ${queue}<span>${formatSeconds(task.duration)} 秒 · ${escapeHtml(task.aspect_ratio)}</span>
           <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>
         </div>
         ${error}
@@ -110,10 +222,10 @@ async function loadHealth() {
     const data = await response.json();
     if (data.engine === 'ok') {
       element.className = 'health ok';
-      element.querySelector('b').textContent = 'H3 服务正常';
+      element.querySelector('b').textContent = 'ComfyUI 正常';
     } else {
       element.className = 'health bad';
-      element.querySelector('b').textContent = 'H3 服务未启动';
+      element.querySelector('b').textContent = 'ComfyUI 未启动';
     }
   } catch (_) {
     element.className = 'health bad';
@@ -128,25 +240,44 @@ document.querySelectorAll('.tab').forEach((button) => {
   });
 });
 
+$('#uploadVideos').addEventListener('change', (event) => {
+  appendSelectedFiles('video', event.currentTarget, [...event.currentTarget.files], 3, $('#videoPreview'));
+});
+$('#referenceImages').addEventListener('change', (event) => {
+  appendSelectedFiles('image', event.currentTarget, [...event.currentTarget.files], 9, $('#imagePreview'));
+});
+
 $('#singleForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = event.submitter;
   button.disabled = true;
   button.textContent = '正在上传…';
   try {
+    const videos = state.selectedVideos;
+    if (!videos.length) throw new Error('请至少上传一个视频');
+    if (videos.length > 3) throw new Error('上传视频最多选择 3 个');
+    if (state.selectedImages.length > 9) throw new Error('参考图片最多上传 9 张');
+    const durations = await Promise.all(videos.map(readVideoDuration));
+    const invalidIndex = durations.findIndex((duration) => duration < 4 || duration > 15);
+    if (invalidIndex >= 0) {
+      throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；H3 视频复刻只支持 4–15 秒`);
+    }
     const body = new FormData(event.currentTarget);
     if (!body.get('seed')) body.delete('seed');
-    await api('/api/tasks', { method: 'POST', body });
+    body.append('video_durations', JSON.stringify(durations));
+    const data = await api('/api/tasks', { method: 'POST', body });
     event.currentTarget.reset();
-    event.currentTarget.querySelector('[name=duration]').value = 5;
-    event.currentTarget.querySelector('[name=source_start]').value = 0;
-    toast('任务已加入队列');
+    state.selectedVideos = [];
+    state.selectedImages = [];
+    clearMediaPreview($('#videoPreview'));
+    clearMediaPreview($('#imagePreview'));
+    toast(`已加入 ${data.created} 个复刻任务`);
     await loadTasks();
   } catch (error) {
     toast(error.message);
   } finally {
     button.disabled = false;
-    button.textContent = '加入生成队列';
+    button.textContent = '批量加入复刻队列';
   }
 });
 
@@ -157,7 +288,8 @@ $('#excelForm').addEventListener('submit', async (event) => {
   button.textContent = '正在导入…';
   const result = $('#importResult');
   try {
-    const data = await api('/api/tasks/import', { method: 'POST', body: new FormData(event.currentTarget) });
+    const body = new FormData(event.currentTarget);
+    const data = await api('/api/tasks/import', { method: 'POST', body });
     result.classList.remove('hidden');
     const details = data.errors.length
       ? `<br>${data.errors.map((item) => `第 ${item.row} 行：${escapeHtml(item.error)}`).join('<br>')}` : '';
@@ -175,7 +307,6 @@ $('#excelForm').addEventListener('submit', async (event) => {
 $('#taskList').addEventListener('click', async (event) => {
   const deleteButton = event.target.closest('[data-delete]');
   const retryButton = event.target.closest('[data-retry]');
-  const downloadLink = event.target.closest('[data-download]');
   if (deleteButton) {
     if (!confirm('确定删除这个任务吗？生成中的任务会同时请求取消。')) return;
     try {
@@ -191,54 +322,12 @@ $('#taskList').addEventListener('click', async (event) => {
       await loadTasks();
     } catch (error) { toast(error.message); }
   }
-  if (downloadLink && state.token) {
-    event.preventDefault();
-    try {
-      const response = await fetch(downloadLink.href, { headers: authHeaders() });
-      if (!response.ok) throw new Error('下载失败');
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = 'result.mp4';
-      anchor.click();
-      URL.revokeObjectURL(url);
-    } catch (error) { toast(error.message); }
-  }
 });
 
 $('#refreshButton').addEventListener('click', () => { loadTasks(); loadHealth(); });
-$('#templateLink').addEventListener('click', async (event) => {
-  if (!state.token) return;
-  event.preventDefault();
-  try {
-    const response = await fetch('/api/template', { headers: authHeaders() });
-    if (!response.ok) throw new Error('模板下载失败');
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = 'h3_tasks_template.xlsx';
-    anchor.click();
-    URL.revokeObjectURL(url);
-  } catch (error) { toast(error.message); }
-});
-$('#tokenForm').addEventListener('submit', (event) => {
-  event.preventDefault();
-  state.token = $('#tokenInput').value.trim();
-  localStorage.setItem('h3_token', state.token);
-  $('#tokenDialog').close();
-  loadTasks();
-});
 
 (async function init() {
-  try {
-    const config = await (await fetch('/api/config')).json();
-    state.authRequired = config.auth_required;
-    if (state.authRequired && !state.token) $('#tokenDialog').showModal();
-  } catch (_) {}
   await Promise.all([loadTasks(true), loadHealth()]);
   setInterval(() => loadTasks(true), 3000);
   setInterval(loadHealth, 15000);
 })();
-

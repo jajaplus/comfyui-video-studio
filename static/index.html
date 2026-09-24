@@ -13,7 +13,7 @@
       <div>
         <div class="eyebrow">MINIMAX H3 · REF2VA</div>
         <h1>视频替换工作台</h1>
-        <p>上传源视频与参考素材，批量生成替换人物或商品的新视频。</p>
+        <p>上传视频与参考图片，批量复刻动作、镜头和声音并替换人物或商品。</p>
       </div>
       <div class="health" id="health"><span></span><b>正在连接</b></div>
     </header>
@@ -34,56 +34,40 @@
           </div>
 
           <form id="singleForm" class="form tab-content active">
-            <label>任务名称<input name="name" placeholder="例如：秋季新品广告"></label>
             <div class="file-field required">
-              <label for="sourceVideo">源视频</label>
-              <input id="sourceVideo" name="source_video" type="file" accept="video/*,.mkv" required>
-              <p>模型会读取选定片段的动作、镜头、场景和声音。</p>
+              <label class="file-label" for="uploadVideos">上传视频</label>
+              <input id="uploadVideos" name="upload_videos" type="file" accept="video/*,.mkv" multiple required>
+              <p>可多次选择并追加，最多 3 个。每个视频创建一个复刻任务，时长必须为 4–15 秒。</p>
             </div>
+            <div id="videoPreview" class="media-preview hidden"></div>
+            <div class="file-field">
+              <label for="referenceImages">参考图片</label>
+              <input id="referenceImages" name="reference_images" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+              <p>可多次选择并追加。人物和商品图片统一上传，最多 9 张。</p>
+            </div>
+            <div id="imagePreview" class="media-preview hidden"></div>
+            <label>提示词<textarea name="prompt" rows="4" placeholder="例如：Picture 1 用于替换人物，Picture 2 用于替换手中的商品；保持上传视频的场景、动作、运镜和声音。"></textarea></label>
             <div class="two-col">
-              <div class="file-field">
-                <label for="characterImage">人物参考图</label>
-                <input id="characterImage" name="character_image" type="file" accept="image/png,image/jpeg,image/webp">
-                <p>建议正面、清晰、无遮挡。</p>
-              </div>
-              <div class="file-field">
-                <label for="productImage">商品参考图</label>
-                <input id="productImage" name="product_image" type="file" accept="image/png,image/jpeg,image/webp">
-                <p>建议白底或主体边缘清晰。</p>
-              </div>
-            </div>
-            <label>补充要求<textarea name="prompt" rows="4" placeholder="例如：保持原视频的服装、运镜和背景，只替换人物面孔及手中的商品。"></textarea></label>
-            <div class="three-col">
-              <label>时长（秒）<input name="duration" type="number" value="5" min="4" max="15" required></label>
               <label>画面比例
                 <select name="aspect_ratio">
-                  <option>16:9</option><option>9:16</option><option>1:1</option>
-                  <option>4:3</option><option>3:4</option><option>21:9</option><option>auto</option>
+                  <option selected>auto</option><option>16:9</option><option>9:16</option><option>1:1</option>
+                  <option>4:3</option><option>3:4</option><option>21:9</option>
                 </select>
               </label>
-              <label>源视频起点<input name="source_start" type="number" value="0" min="0" step="0.1"></label>
-            </div>
-            <details>
-              <summary>高级设置</summary>
               <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
-            </details>
-            <button class="primary" type="submit">加入生成队列</button>
+            </div>
+            <button class="primary" type="submit">批量加入复刻队列</button>
           </form>
 
           <form id="excelForm" class="form tab-content">
             <div class="bulk-intro">
               <h2>批量创建任务</h2>
-              <p>先下载模板。Excel 每行代表一个任务，素材列填写文件名；导入时同时选择这些视频和图片。</p>
+              <p>先下载模板。Excel 每行代表一个任务，视频和参考图片 URL 必须由用户自行提供，并且能被服务器公开访问。</p>
               <a id="templateLink" class="secondary" href="/api/template">下载 Excel 模板</a>
             </div>
             <div class="file-field required">
-              <label for="excelFile">任务表</label>
+              <label class="file-label" for="excelFile">任务表</label>
               <input id="excelFile" name="excel" type="file" accept=".xlsx,.xlsm" required>
-            </div>
-            <div class="file-field required">
-              <label for="mediaFiles">表中引用的全部素材</label>
-              <input id="mediaFiles" name="media" type="file" accept="video/*,image/*,.mkv" multiple required>
-              <p>按文件名匹配，不要求按任务分文件夹。文件名不能重复。</p>
             </div>
             <button class="primary" type="submit">导入并加入队列</button>
             <div id="importResult" class="import-result hidden"></div>
@@ -103,19 +87,11 @@
 
       <aside class="notice">
         <b>生成边界</b>
-        <p>Ref2VA 会依据源视频重新生成内容，并非逐帧贴图。快速动作、手部遮挡、小字包装和长镜头可能出现变化。每个任务建议先测试 4–5 秒片段。</p>
+        <p>Ref2VA 会依据上传视频重新生成内容，并非逐帧贴图。单个视频必须为 4–15 秒；快速动作、手部遮挡和小字包装可能出现变化。</p>
       </aside>
     </main>
   </div>
 
-  <dialog id="tokenDialog">
-    <form method="dialog" id="tokenForm">
-      <h2>输入访问令牌</h2>
-      <p>服务器已开启访问保护。令牌只保存在当前浏览器。</p>
-      <input id="tokenInput" type="password" autocomplete="current-password" required placeholder="H3_STUDIO_TOKEN">
-      <button class="primary" value="default">进入工作台</button>
-    </form>
-  </dialog>
   <div id="toast" class="toast hidden"></div>
   <script src="/app.js" defer></script>
 </body>

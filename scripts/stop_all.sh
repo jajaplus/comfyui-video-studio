@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-for service in app h3; do
+for service in app comfyui; do
   pid_file="logs/${service}.pid"
   if [[ -f "$pid_file" ]]; then
     pid="$(cat "$pid_file")"
@@ -15,4 +15,3 @@ for service in app h3; do
     rm -f "$pid_file"
   fi
 done
-
