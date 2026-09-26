@@ -161,10 +161,10 @@ if [ ! -x "$FACEFUSION_ENV/bin/python" ]; then
 fi
 if [ "$FORCE_INSTALL" = "1" ] || ! (
   cd "$FACEFUSION_DIR"
-  "$FACEFUSION_ENV/bin/python" -c "import cv2, numpy, onnxruntime" >/dev/null 2>&1
+  "$FACEFUSION_ENV/bin/python" -c "import cv2, numpy, onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()" >/dev/null 2>&1
   "$FACEFUSION_ENV/bin/python" facefusion.py --version >/dev/null 2>&1
 ); then
-  echo "安装 FaceFusion Python 依赖（仅首次安装或环境不完整时执行）"
+  echo "安装 FaceFusion CUDA Python 依赖（仅首次安装、环境不完整或 CUDA Provider 缺失时执行）"
   (
     cd "$FACEFUSION_DIR"
     "$CONDA_BIN" run --no-capture-output \
@@ -174,6 +174,9 @@ if [ "$FORCE_INSTALL" = "1" ] || ! (
 else
   echo "复用 FaceFusion Python 环境：$FACEFUSION_ENV"
 fi
+
+"$FACEFUSION_ENV/bin/python" -c \
+  "import onnxruntime as ort; providers=ort.get_available_providers(); assert 'CUDAExecutionProvider' in providers, f'FaceFusion CUDA Provider 不可用：{providers}'; print('FaceFusion CUDA Provider 正常：', providers)"
 
 PREFETCH_ARGUMENTS=(
   --facefusion-dir "$FACEFUSION_DIR"

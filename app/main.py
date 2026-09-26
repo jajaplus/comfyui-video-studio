@@ -30,6 +30,13 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def absolute_path_without_resolving(value: str | os.PathLike[str]) -> Path:
+    """Make a path absolute while preserving virtualenv interpreter symlinks."""
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
 STATIC_DIR = ROOT / "static"
 DATA_DIR = Path(os.getenv("H3_STUDIO_DATA_DIR", ROOT / "data")).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -49,7 +56,8 @@ PRECISION_TOOLS_DIR = Path(
 ).resolve()
 SAM2_PYTHON = Path(
     os.getenv("H3_SAM2_PYTHON", PRECISION_TOOLS_DIR / "sam2-env" / "bin" / "python")
-).resolve()
+)
+SAM2_PYTHON = absolute_path_without_resolving(SAM2_PYTHON)
 SAM2_SCRIPT = Path(
     os.getenv("H3_SAM2_SCRIPT", ROOT / "scripts" / "sam2_product_composite.py")
 ).resolve()
@@ -70,7 +78,8 @@ FACEFUSION_DIR = Path(
 ).resolve()
 FACEFUSION_PYTHON = Path(
     os.getenv("H3_FACEFUSION_PYTHON", PRECISION_TOOLS_DIR / "facefusion-env" / "bin" / "python")
-).resolve()
+)
+FACEFUSION_PYTHON = absolute_path_without_resolving(FACEFUSION_PYTHON)
 COMFYUI_UNET = os.getenv(
     "H3_COMFYUI_UNET", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 )
@@ -96,6 +105,10 @@ DEFAULT_SAMPLER = "res_multistep"
 DEFAULT_SCHEDULER = "simple"
 DEFAULT_STEPS = 20
 DEFAULT_DENOISE = 1.0
+
+
+class BlackVideoError(RuntimeError):
+    pass
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -758,6 +771,40 @@ def probe_video_dimensions(source: str | Path) -> tuple[int, int] | None:
         return None
 
 
+def signalstats_indicates_black(output: str) -> bool:
+    averages = [float(value) for value in re.findall(r"lavfi\.signalstats\.YAVG=([0-9.]+)", output)]
+    maximums = [float(value) for value in re.findall(r"lavfi\.signalstats\.YMAX=([0-9.]+)", output)]
+    return bool(averages and maximums) and max(averages) <= 18.0 and max(maximums) <= 32.0
+
+
+def video_appears_black(source: Path) -> bool:
+    try:
+        sample_rate = min(1.0, 8.0 / probe_video_duration(source))
+    except (TypeError, ValueError):
+        sample_rate = 1.0
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(source),
+                "-vf", f"fps={sample_rate:.8f},scale=64:-2,signalstats,metadata=print",
+                "-frames:v", "8", "-an", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and signalstats_indicates_black(
+        f"{completed.stdout}\n{completed.stderr}"
+    )
+
+
+def ensure_visible_video(source: Path, stage: str) -> None:
+    if not source.is_file() or source.stat().st_size == 0:
+        raise RuntimeError(f"{stage}没有生成有效视频")
+    if video_appears_black(source):
+        raise BlackVideoError(f"{stage}检测为全黑画面")
+
+
 def next_workflow_node_id(workflow: dict[str, Any]) -> str:
     return str(max(int(node_id) for node_id in workflow) + 1)
 
@@ -887,7 +934,8 @@ def run_ffmpeg(arguments: list[str], purpose: str) -> None:
 
 def run_external_command(
     command: list[str], purpose: str, cwd: Path | None = None,
-) -> None:
+    log_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
             command,
@@ -900,9 +948,16 @@ def run_external_command(
         raise RuntimeError(f"{purpose}所需程序不存在：{command[0]}") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"{purpose}超时") from exc
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            f"STDOUT\n{completed.stdout}\n\nSTDERR\n{completed.stderr}",
+            encoding="utf-8",
+        )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "未知错误").strip()[-4000:]
         raise RuntimeError(f"{purpose}失败：{detail}")
+    return completed
 
 
 def parse_product_box(row: sqlite3.Row | dict[str, Any]) -> list[float] | None:
@@ -974,6 +1029,32 @@ def materialize_reference_images(
     return results
 
 
+def facefusion_execution_providers() -> list[str]:
+    try:
+        completed = subprocess.run(
+            [
+                str(FACEFUSION_PYTHON), "-c",
+                "import json, onnxruntime as ort; print(json.dumps(ort.get_available_providers()))",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("无法检查 FaceFusion ONNX Runtime") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "未知错误").strip()[-2000:]
+        raise RuntimeError(f"检查 FaceFusion ONNX Runtime 失败：{detail}")
+    try:
+        providers = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError("FaceFusion ONNX Runtime 没有返回执行设备") from exc
+    if "CUDAExecutionProvider" not in providers:
+        raise RuntimeError(
+            "FaceFusion CUDA 未启用，当前执行设备为 "
+            f"{', '.join(providers) or '无'}；请重新运行 scripts/install_precision_tools.sh"
+        )
+    return [str(provider) for provider in providers]
+
+
 def run_facefusion(
     face_references: list[Path], target: Path, destination: Path, work_folder: Path,
 ) -> None:
@@ -981,6 +1062,7 @@ def run_facefusion(
     if not FACEFUSION_PYTHON.is_file() or not entrypoint.is_file():
         raise RuntimeError("FaceFusion 换脸工具未安装，请运行 scripts/install_precision_tools.sh")
     unload_comfy_models()
+    facefusion_execution_providers()
     run_external_command(
         [
             str(FACEFUSION_PYTHON), str(entrypoint), "headless-run",
@@ -1002,9 +1084,9 @@ def run_facefusion(
         ],
         "FaceFusion 人脸替换",
         cwd=FACEFUSION_DIR,
+        log_path=work_folder / "facefusion.log",
     )
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError("FaceFusion 没有生成换脸视频")
+    ensure_visible_video(destination, "FaceFusion 输出")
 
 
 def restore_original_audio(processed: Path, source: Path, destination: Path) -> None:
@@ -1247,6 +1329,7 @@ def process_task(row: sqlite3.Row) -> None:
     task_id = row["id"]
     work_folder = WORK_DIR / task_id
     destination = OUTPUT_DIR / f"{task_id}.mp4"
+    keep_work_folder = False
     try:
         precision_mode = bool(row["precision_mode"]) if "precision_mode" in row.keys() else False
         face_sources = row_reference_paths(row, "face")
@@ -1256,6 +1339,7 @@ def process_task(row: sqlite3.Row) -> None:
         durations = segment_durations(float(row["duration"]))
         segment_count = len(durations) if (not precision_mode or product_sources) else 1
         mark_task(task_id, segment_count=segment_count, current_segment=0)
+        shutil.rmtree(work_folder, ignore_errors=True)
         work_folder.mkdir(parents=True, exist_ok=True)
 
         if precision_mode:
@@ -1323,6 +1407,7 @@ def process_task(row: sqlite3.Row) -> None:
                     stage="合并商品候选片段" if len(generated_parts) > 1 else "准备商品候选视频",
                 )
                 concat_generated_videos(generated_parts, candidate, work_folder)
+                ensure_visible_video(candidate, "MiniMax-H3 商品候选视频")
                 product_stage = (
                     "SAM2 跟踪修正后的商品区域"
                     if product_box is not None
@@ -1334,6 +1419,7 @@ def process_task(row: sqlite3.Row) -> None:
                     local_source, candidate, product_box, product_references[0],
                     str(row["prompt"] or ""), product_composite, work_folder,
                 )
+                ensure_visible_video(product_composite, "SAM2 商品合成视频")
                 working_video = product_composite
 
             if task_was_cancelled(task_id, destination):
@@ -1352,6 +1438,7 @@ def process_task(row: sqlite3.Row) -> None:
                 return
             mark_task(task_id, progress=99, stage="恢复原视频声音")
             restore_original_audio(working_video, local_source, destination)
+            ensure_visible_video(destination, "最终视频")
             if task_was_cancelled(task_id, destination):
                 return
             mark_task(
@@ -1385,6 +1472,7 @@ def process_task(row: sqlite3.Row) -> None:
             return
         mark_task(task_id, progress=96, stage="合并生成片段" if segment_count > 1 else "保存生成视频")
         concat_generated_videos(generated_parts, destination, work_folder)
+        ensure_visible_video(destination, "最终视频")
         if task_was_cancelled(task_id, destination):
             return
         mark_task(
@@ -1393,13 +1481,18 @@ def process_task(row: sqlite3.Row) -> None:
             finished_at=utcnow(), error=None,
         )
     except Exception as exc:
+        keep_work_folder = isinstance(exc, BlackVideoError)
         destination.unlink(missing_ok=True)
+        detail = str(exc)
+        if keep_work_folder:
+            detail = f"{detail}；中间文件已保留：{work_folder}"
         mark_task(
             task_id, status="failed", progress=0, stage="生成失败",
-            error=str(exc)[:4000], finished_at=utcnow(),
+            error=detail[:4000], finished_at=utcnow(),
         )
     finally:
-        shutil.rmtree(work_folder, ignore_errors=True)
+        if not keep_work_folder:
+            shutil.rmtree(work_folder, ignore_errors=True)
 
 
 def worker_loop() -> None:

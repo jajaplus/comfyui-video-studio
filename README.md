@@ -461,8 +461,9 @@ scripts/start_all.sh
 检查安装结果：
 
 ```bash
-/root/autodl-tmp/h3-precision-tools/sam2-env/bin/python -c "import sam2; print('SAM2 正常')"
+/root/autodl-tmp/h3-precision-tools/sam2-env/bin/python -c "import cv2, numpy, sam2; print('SAM2 与 OpenCV 正常')"
 /root/autodl-tmp/h3-precision-tools/sam2-env/bin/python -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('/root/autodl-tmp/h3-precision-tools/models/Florence-2-base-ft', trust_remote_code=True, local_files_only=True); print('Florence-2 正常')"
+/root/autodl-tmp/h3-precision-tools/facefusion-env/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers()); assert 'CUDAExecutionProvider' in ort.get_available_providers()"
 /root/autodl-tmp/h3-precision-tools/facefusion-env/bin/python /root/autodl-tmp/h3-precision-tools/facefusion/facefusion.py --version
 ```
 

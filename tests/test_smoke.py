@@ -317,6 +317,32 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(completed["stage"], "精准替换完成")
         self.assertEqual((completed["output_width"], completed["output_height"]), (1920, 1080))
 
+    def test_09_virtualenv_python_symlink_is_not_resolved(self) -> None:
+        folder = Path(self.temp.name) / "python-paths"
+        target = folder / "base" / "python"
+        interpreter = folder / "sam2-env" / "bin" / "python"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("python")
+        interpreter.symlink_to(target)
+
+        preserved = self.main.absolute_path_without_resolving(interpreter)
+        self.assertEqual(preserved, interpreter.absolute())
+        self.assertNotEqual(preserved, interpreter.resolve())
+
+    def test_10_black_frame_signal_detection(self) -> None:
+        black = "\n".join([
+            "lavfi.signalstats.YAVG=16", "lavfi.signalstats.YMAX=16",
+            "lavfi.signalstats.YAVG=16.2", "lavfi.signalstats.YMAX=17",
+        ])
+        visible = "\n".join([
+            "lavfi.signalstats.YAVG=16", "lavfi.signalstats.YMAX=16",
+            "lavfi.signalstats.YAVG=42", "lavfi.signalstats.YMAX=201",
+        ])
+        self.assertTrue(self.main.signalstats_indicates_black(black))
+        self.assertFalse(self.main.signalstats_indicates_black(visible))
+        self.assertFalse(self.main.signalstats_indicates_black(""))
+
 
 if __name__ == "__main__":
     unittest.main()
