@@ -56,7 +56,7 @@
             <div class="file-field required">
               <label class="file-label" for="uploadVideos">上传视频</label>
               <input id="uploadVideos" name="upload_videos" type="file" accept="video/*,.mkv" multiple required>
-              <p>可多次选择并追加，最多 3 个。每个视频创建一个复刻任务，时长必须为 4–15 秒。</p>
+              <p>可多次选择并追加，最多 3 个。视频不能短于 4 秒；超过 15 秒会自动分段生成并合并。</p>
             </div>
             <div id="videoPreview" class="media-preview hidden"></div>
             <div class="file-field">
@@ -66,15 +66,23 @@
             </div>
             <div id="imagePreview" class="media-preview hidden"></div>
             <label>提示词<textarea name="prompt" rows="4" placeholder="例如：Picture 1 用于替换人物，Picture 2 用于替换手中的商品；保持上传视频的场景、动作、运镜和声音。"></textarea></label>
-            <div class="two-col">
+            <div class="three-col">
               <label>画面比例
                 <select name="aspect_ratio">
                   <option selected>auto</option><option>16:9</option><option>9:16</option><option>1:1</option>
                   <option>4:3</option><option>3:4</option><option>21:9</option>
                 </select>
               </label>
+              <label>视频清晰度
+                <select name="quality">
+                  <option value="low" selected>低清 · 672×384（16:9）</option>
+                  <option value="standard">标清 · 832×480（16:9）</option>
+                  <option value="high">高清 · 1344×768（16:9）</option>
+                </select>
+              </label>
               <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
             </div>
+            <p class="resolution-hint" id="qualityResolution">预计输出尺寸：672×384</p>
             <button class="primary" type="submit">批量加入复刻队列</button>
           </form>
 
@@ -106,12 +114,12 @@
 
       <aside class="notice">
         <b>生成边界</b>
-        <p>Ref2VA 会依据上传视频重新生成内容，并非逐帧贴图。单个视频必须为 4–15 秒；快速动作、手部遮挡和小字包装可能出现变化。</p>
+        <p>Ref2VA 单次生成支持 4–15 秒。更长的视频会切成多个片段依次生成，再自动合并；片段连接处可能出现轻微画面或声音跳变。</p>
       </aside>
     </main>
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/app.js?v=5" defer></script>
+  <script src="/app.js?v=9" defer></script>
 </body>
 </html>

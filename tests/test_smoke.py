@@ -58,6 +58,8 @@ class StudioSmokeTest(unittest.TestCase):
                 self.assertIn("ref_videos.ref_video_0", sampler)
                 self.assertIn("ref_images.ref_image_0", sampler)
                 self.assertIn("ref_images.ref_image_1", sampler)
+                self.assertEqual(sampler["width"], 672)
+                self.assertEqual(sampler["height"], 384)
                 return {"prompt_id": "comfy-1"}
             if "/history/comfy-1" in url:
                 return {"comfy-1": {
@@ -80,6 +82,7 @@ class StudioSmokeTest(unittest.TestCase):
             completed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["stage"], "生成完成")
+        self.assertEqual((completed["output_width"], completed["output_height"]), (672, 384))
         self.assertTrue(Path(completed["output_path"]).is_file())
         result = self.main.delete_task(task_id)
         self.assertTrue(result["deleted"])
@@ -118,6 +121,8 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(template.sheetnames, ["任务", "字段说明"])
         self.assertEqual(template["任务"]["A1"].value, "upload_video_url")
         self.assertEqual(template["任务"]["B1"].value, "reference_image_urls")
+        self.assertEqual(template["任务"]["E1"].value, "quality")
+        self.assertEqual(template["任务"]["E2"].value, "low")
         self.assertGreater(len(template["任务"].data_validations.dataValidation), 0)
 
     def test_03_manual_multiple_videos(self) -> None:
@@ -140,12 +145,13 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         with self.main.connect_db() as conn:
             rows = conn.execute(
-                "SELECT name,duration,reference_images FROM tasks WHERE id IN (?,?) ORDER BY name",
+                "SELECT name,duration,reference_images,quality FROM tasks WHERE id IN (?,?) ORDER BY name",
                 result["task_ids"],
             ).fetchall()
         self.assertEqual([row["name"] for row in rows], ["one", "two"])
         self.assertEqual([row["duration"] for row in rows], [5.2, 8.4])
         self.assertTrue(all(len(json.loads(row["reference_images"])) == 2 for row in rows))
+        self.assertTrue(all(row["quality"] == "low" for row in rows))
 
     def test_04_gpu_status_parser(self) -> None:
         parsed = self.main.parse_nvidia_smi(
@@ -170,6 +176,61 @@ class StudioSmokeTest(unittest.TestCase):
         values = mark.call_args.kwargs
         self.assertEqual(values["stage"], "采样生成视频（10/20）")
         self.assertGreater(values["progress"], 50)
+
+    def test_06_long_video_segment_plan(self) -> None:
+        self.assertEqual(self.main.segment_durations(15), [15.0])
+        self.assertEqual(self.main.segment_durations(16), [8.0, 8.0])
+        parts = self.main.segment_durations(31)
+        self.assertEqual(len(parts), 3)
+        self.assertAlmostEqual(sum(parts), 31.0, places=3)
+        self.assertTrue(all(4 <= value <= 15 for value in parts))
+
+    def test_07_long_video_processes_parts_and_merges(self) -> None:
+        folder = Path(self.temp.name) / "long-video"
+        folder.mkdir(exist_ok=True)
+        source = folder / "source.mp4"
+        source.write_bytes(b"long-video")
+        task_id = self.main.insert_task(
+            prompt="Replace the person.", source_video=source,
+            reference_images=[], duration=31.0,
+            aspect_ratio="auto", seed=7, display_name="long.mp4",
+        )
+        with self.main.connect_db() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+        observed: list[tuple[int, int, float]] = []
+
+        def fake_split(_, durations, work_folder):
+            parts = []
+            for index, _duration in enumerate(durations, start=1):
+                part = work_folder / f"source_part_{index:03d}.mp4"
+                part.write_bytes(b"source-part")
+                parts.append(part)
+            return parts
+
+        def fake_segment(parent_id, segment_row, index, count, destination):
+            self.assertEqual(parent_id, task_id)
+            observed.append((index, count, segment_row["duration"]))
+            destination.write_bytes(b"generated-part")
+            return True
+
+        def fake_concat(parts, destination, _work_folder):
+            self.assertEqual(len(parts), 3)
+            destination.write_bytes(b"merged-video")
+
+        with patch.object(self.main, "split_source_video", side_effect=fake_split), patch.object(
+            self.main, "run_comfy_segment", side_effect=fake_segment
+        ), patch.object(self.main, "concat_generated_videos", side_effect=fake_concat):
+            self.main.process_task(row)
+
+        self.assertEqual(len(observed), 3)
+        self.assertAlmostEqual(sum(item[2] for item in observed), 31.0, places=3)
+        with self.main.connect_db() as conn:
+            completed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["segment_count"], 3)
+        self.assertEqual(completed["current_segment"], 3)
+        self.assertTrue(Path(completed["output_path"]).is_file())
 
 
 if __name__ == "__main__":

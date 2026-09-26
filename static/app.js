@@ -3,12 +3,29 @@ const state = {
   selectedVideos: [],
   selectedImages: [],
 };
-const videoDurationCache = new WeakMap();
+const videoMetadataCache = new WeakMap();
 
 const $ = (selector) => document.querySelector(selector);
 const statusLabels = {
   queued: '排队中', starting: '正在启动', running: '生成中',
   completed: '已完成', failed: '失败', cancelled: '已取消',
+};
+const qualityLabels = {
+  low: '低清', standard: '标清', high: '高清',
+};
+const qualityDimensions = {
+  low: {
+    '16:9': [672, 384], '9:16': [384, 672], '1:1': [512, 512],
+    '4:3': [576, 448], '3:4': [448, 576], '21:9': [768, 320],
+  },
+  standard: {
+    '16:9': [832, 480], '9:16': [480, 832], '1:1': [640, 640],
+    '4:3': [736, 544], '3:4': [544, 736], '21:9': [960, 416],
+  },
+  high: {
+    '16:9': [1344, 768], '9:16': [768, 1344], '1:1': [1024, 1024],
+    '4:3': [1024, 768], '3:4': [768, 1024], '21:9': [1568, 672],
+  },
 };
 
 async function api(path, options = {}) {
@@ -47,26 +64,65 @@ function formatSeconds(value) {
   return Number.isInteger(number) ? `${number}` : number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+function formatElapsedSeconds(value) {
+  const total = Math.max(0, Math.floor(Number(value || 0)));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours) return `${hours}小时${minutes}分${seconds}秒`;
+  if (minutes) return `${minutes}分${seconds}秒`;
+  return `${seconds}秒`;
+}
+
+function elapsedSeconds(startedAt, finishedAt = '') {
+  const start = new Date(startedAt).getTime();
+  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+  return Math.max(0, (end - start) / 1000);
+}
+
+function elapsedLabel(startedAt, finishedAt = '') {
+  const prefix = finishedAt ? '总耗时' : '已耗时';
+  return `${prefix} ${formatElapsedSeconds(elapsedSeconds(startedAt, finishedAt))}`;
+}
+
+function updateElapsedTimes() {
+  document.querySelectorAll('[data-elapsed-start]').forEach((element) => {
+    element.textContent = elapsedLabel(
+      element.dataset.elapsedStart,
+      element.dataset.elapsedFinish || '',
+    );
+  });
+}
+
 function formatMegabytes(value) {
   const number = Number(value || 0);
   return number >= 1024 ? `${(number / 1024).toFixed(1)} GB` : `${Math.round(number)} MB`;
+}
+
+function segmentCount(duration) {
+  return Math.max(1, Math.ceil(Number(duration || 0) / 15));
 }
 
 function isVideo(file) {
   return file.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi)$/i.test(file.name);
 }
 
-function readVideoDuration(file) {
-  if (videoDurationCache.has(file)) return Promise.resolve(videoDurationCache.get(file));
+function readVideoMetadata(file) {
+  if (videoMetadataCache.has(file)) return Promise.resolve(videoMetadataCache.get(file));
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
     const url = URL.createObjectURL(file);
     video.preload = 'metadata';
     video.onloadedmetadata = () => {
-      const duration = Number(video.duration.toFixed(3));
-      videoDurationCache.set(file, duration);
+      const metadata = {
+        duration: Number(video.duration.toFixed(3)),
+        width: Number(video.videoWidth || 0),
+        height: Number(video.videoHeight || 0),
+      };
+      videoMetadataCache.set(file, metadata);
       URL.revokeObjectURL(url);
-      resolve(duration);
+      resolve(metadata);
     };
     video.onerror = () => {
       URL.revokeObjectURL(url);
@@ -74,6 +130,44 @@ function readVideoDuration(file) {
     };
     video.src = url;
   });
+}
+
+function readVideoDuration(file) {
+  return readVideoMetadata(file).then((metadata) => metadata.duration);
+}
+
+function closestAspectRatio(width, height) {
+  if (!width || !height) return '16:9';
+  const ratio = width / height;
+  const ratios = {
+    '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1,
+    '4:3': 4 / 3, '3:4': 3 / 4, '21:9': 21 / 9,
+  };
+  return Object.keys(ratios).reduce((best, name) => (
+    Math.abs(ratio - ratios[name]) < Math.abs(ratio - ratios[best]) ? name : best
+  ), '16:9');
+}
+
+function updateQualityResolution() {
+  const form = $('#singleForm');
+  const hint = $('#qualityResolution');
+  if (!form || !hint) return;
+  const quality = form.elements.quality.value || 'low';
+  const selectedRatio = form.elements.aspect_ratio.value || 'auto';
+  let ratios = [selectedRatio];
+  if (selectedRatio === 'auto') {
+    ratios = [...new Set(state.selectedVideos.map((file) => {
+      const metadata = videoMetadataCache.get(file);
+      return metadata ? closestAspectRatio(metadata.width, metadata.height) : '16:9';
+    }))];
+    if (!ratios.length) ratios = ['16:9'];
+  }
+  const sizes = ratios.map((ratio) => {
+    const [width, height] = qualityDimensions[quality][ratio];
+    return `${width}×${height}`;
+  });
+  const autoText = selectedRatio === 'auto' ? '（按每个上传视频的比例）' : '';
+  hint.textContent = `预计输出尺寸：${sizes.join(' / ')} ${autoText}`.trim();
 }
 
 function clearMediaPreview(container) {
@@ -130,16 +224,20 @@ function renderMediaPreview(files, container, kind) {
       state[stateKey] = state[stateKey].filter((item) => fileKey(item) !== fileKey(file));
       syncFileInput(input, state[stateKey]);
       renderMediaPreview(state[stateKey], container, kind);
+      if (kind === 'video') updateQualityResolution();
     });
     card.append(media, info, remove);
     container.append(card);
     if (isVideo(file)) {
-      readVideoDuration(file).then((duration) => {
-        meta.textContent = `${formatSeconds(duration)} 秒`;
-        if (duration < 4 || duration > 15) {
+      readVideoMetadata(file).then((metadata) => {
+        meta.textContent = `${formatSeconds(metadata.duration)} 秒 · 原视频 ${metadata.width}×${metadata.height}`;
+        if (metadata.duration < 4) {
           meta.className = 'invalid';
-          meta.textContent += ' · 超出 H3 的 4–15 秒限制';
+          meta.textContent += ' · 视频不能短于 4 秒';
+        } else if (metadata.duration > 15) {
+          meta.textContent += ` · 将自动切成 ${segmentCount(metadata.duration)} 段生成后合并`;
         }
+        updateQualityResolution();
       }).catch((error) => {
         meta.className = 'invalid';
         meta.textContent = error.message;
@@ -164,6 +262,7 @@ function appendSelectedFiles(kind, input, newFiles, maxFiles, container) {
   state[stateKey] = merged;
   syncFileInput(input, merged);
   renderMediaPreview(merged, container, kind);
+  if (kind === 'video') updateQualityResolution();
 }
 
 function renderTasks() {
@@ -194,6 +293,17 @@ function renderTasks() {
       ? `<button data-retry="${task.id}">重试</button>` : '';
     const progressValue = Math.max(0, Math.min(100, Number(task.progress || 0)));
     const stage = task.stage || (task.status === 'queued' ? '等待队列' : status);
+    const segments = Number(task.segment_count || 1) > 1
+      ? ` · ${Number(task.segment_count)} 段` : '';
+    const quality = qualityLabels[task.quality] || qualityLabels.low;
+    const presetSize = task.aspect_ratio !== 'auto'
+      ? qualityDimensions[task.quality || 'low']?.[task.aspect_ratio] : null;
+    const resolution = task.output_width && task.output_height
+      ? `${task.output_width}×${task.output_height}`
+      : (presetSize ? `${presetSize[0]}×${presetSize[1]}` : '等待计算尺寸');
+    const elapsed = task.started_at
+      ? `<span class="task-elapsed" data-elapsed-start="${escapeHtml(task.started_at)}" data-elapsed-finish="${escapeHtml(task.finished_at || '')}">${escapeHtml(elapsedLabel(task.started_at, task.finished_at || ''))}</span>`
+      : '';
     return `<article class="task">
       <div class="task-main">
         <div class="task-head">
@@ -201,8 +311,8 @@ function renderTasks() {
           <span class="badge ${escapeHtml(task.status)}">${escapeHtml(status)}</span>
         </div>
         <div class="task-meta">
-          ${queue}<span>${formatSeconds(task.duration)} 秒 · ${escapeHtml(task.aspect_ratio)}</span>
-          <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>
+          ${queue}<span>${formatSeconds(task.duration)} 秒${segments} · ${escapeHtml(task.aspect_ratio)} · ${escapeHtml(quality)} ${escapeHtml(resolution)}</span>
+          <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>${elapsed}
         </div>
         ${error}
         <div class="task-stage"><span>${escapeHtml(stage)}</span><strong>${progressValue}%</strong></div>
@@ -297,6 +407,8 @@ $('#uploadVideos').addEventListener('change', (event) => {
 $('#referenceImages').addEventListener('change', (event) => {
   appendSelectedFiles('image', event.currentTarget, [...event.currentTarget.files], 9, $('#imagePreview'));
 });
+$('#singleForm').elements.aspect_ratio.addEventListener('change', updateQualityResolution);
+$('#singleForm').elements.quality.addEventListener('change', updateQualityResolution);
 
 $('#singleForm').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -310,9 +422,9 @@ $('#singleForm').addEventListener('submit', async (event) => {
     if (videos.length > 3) throw new Error('上传视频最多选择 3 个');
     if (state.selectedImages.length > 9) throw new Error('参考图片最多上传 9 张');
     const durations = await Promise.all(videos.map(readVideoDuration));
-    const invalidIndex = durations.findIndex((duration) => duration < 4 || duration > 15);
+    const invalidIndex = durations.findIndex((duration) => duration < 4);
     if (invalidIndex >= 0) {
-      throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；H3 视频复刻只支持 4–15 秒`);
+      throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；视频不能短于 4 秒`);
     }
     const body = new FormData(form);
     if (!body.get('seed')) body.delete('seed');
@@ -323,6 +435,7 @@ $('#singleForm').addEventListener('submit', async (event) => {
     state.selectedImages = [];
     clearMediaPreview($('#videoPreview'));
     clearMediaPreview($('#imagePreview'));
+    updateQualityResolution();
     toast(`已加入 ${data.created} 个复刻任务`);
     await loadTasks();
   } catch (error) {
@@ -380,8 +493,10 @@ $('#taskList').addEventListener('click', async (event) => {
 $('#refreshButton').addEventListener('click', () => { loadTasks(); loadHealth(); });
 
 (async function init() {
+  updateQualityResolution();
   await Promise.all([loadTasks(true), loadHealth(), loadSystemStatus()]);
   setInterval(() => loadTasks(true), 3000);
+  setInterval(updateElapsedTimes, 1000);
   setInterval(loadSystemStatus, 3000);
   setInterval(loadHealth, 15000);
 })();
