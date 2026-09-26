@@ -1,99 +1,8 @@
-# MiniMax H3 视频替换工作台
+# MiniMax H3 视频替换工作台部署手册
 
-这是一个部署在 AutoDL 上的视频精准替换客户端。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序执行 MiniMax-H3、Florence-2、SAM2 与 FaceFusion。网页不设置登录或访问令牌，打开地址即可使用。
+本文只保留 Mac 打包上传、AutoDL 首次部署、模型加载、服务启动、代码更新、本地查看和部署故障处理。
 
-优先使用已经包含 `/root/ComfyUI` 的 AutoDL 应用镜像，项目会直接复用它且不主动更新。服务器没有 ComfyUI，或者镜像自带版本缺少 H3 节点但又不希望修改原目录时，可以按第 2.2 节另装一份到 `/root/autodl-tmp/ComfyUI`；两种方式只选择一种。
-
-## 功能
-
-- 视频和参考图片可多次选择、累计上传、预览和逐项删除。
-- 一次最多选择 3 个视频，每个视频建立一个独立队列任务。
-- 每个任务使用 1 个上传视频和最多 9 张参考图，每张图明确选择“脸部”或“商品”。
-- 使用商品参考图时，Florence-2 根据提示词和参考图自动识别视频中的原商品；首帧手动框选仅作为识别不准时的可选修正。
-- 商品替换由 MiniMax-H3 生成候选画面，SAM2 跟踪自动识别或手动修正的商品蒙版，并只把候选画面的商品区域合成回原视频。
-- 脸部替换在商品合成后由 FaceFusion 完成，并组合方框、遮挡和面部区域蒙版；人物的身体、服装、动作与背景继续使用原视频像素。
-- 最终成片恢复上传视频的原声音轨。
-- 视频时长自动读取并显示，视频不能短于 4 秒。
-- 超过 15 秒的视频会切成多个长度接近的 4–15 秒片段，依次生成后自动合并成一个视频。
-- 生成总时长跟随上传视频，画面比例默认跟随视频方向。
-- 视频清晰度支持低清、标清和高清三档，默认低清以缩短生成时间。
-- Scheduler、Sampler、Steps 和 Denoise 可在客户端逐任务设置，任务列表显示实际参数。
-- Excel 一次最多导入 3 个任务，素材 URL 由用户自行填写。
-- SQLite 持久化队列，支持查看进度、下载、失败重试和删除任务。
-- 客户端每 3 秒刷新 GPU 利用率、显存、温度和功耗。
-- 当前任务显示准备素材、模型加载、参考编码、采样、视频解码和保存等环节。
-- 生成中的任务按秒显示已耗时，结束后保留包含切割、生成和合并过程的总耗时。
-- ComfyUI 原生 `MiniMaxH3ReferenceToVideo` 只负责商品候选画面；仅换脸的任务不会启动 H3。
-
-精准模式的处理顺序如下：
-
-```text
-上传的原视频
-  → MiniMax-H3 生成商品候选画面（仅有商品参考图时）
-  → Florence-2 根据提示词和商品参考图识别首帧原商品
-  → SAM2 跟踪商品区域并局部合成
-  → FaceFusion 替换脸部（仅有脸部参考图时）
-  → 恢复原视频声音
-  → 输出成片
-```
-
-这条链路避免让 H3 直接重画整个人物。商品区域之外始终来自原视频；换脸也在最后单独执行。自动识别或 SAM2 跟踪仍可能在目标描述不清、强遮挡、商品完全离开画面、严重运动模糊或镜头切换时出错。遇到识别不准时，可点击视频预览下方的“修正商品区域”手动框选，正式生成前建议先用短视频测试。
-
-为了提高局部替换成功率：
-
-1. 脸部参考图尽量使用清晰、无遮挡、接近正面的单人照片，不要把参考图的服装、姿势或背景作为替换目标。
-2. 商品参考图尽量完整、清晰、背景简单；原视频中必须已经存在需要替换的商品。
-3. 在每张参考图下方选择正确类型；提示词写清原视频中的目标，例如“人物身上的上衣换成参考图2”。
-4. 默认不需要框选。自动识别不准时，再用“修正商品区域”完整框住原商品并略留边缘。
-5. 低清适合测试速度；正式商品生成建议选择 `standard` 或 `high`。FaceFusion 的换脸质量不受 H3 清晰度选项影响。
-
-长视频的每个片段由模型独立生成，因此片段连接处可能出现轻微的画面、人物细节或声音跳变。任务列表会显示总片段数、当前片段和整体进度；任意片段失败时可直接重试整个任务。
-
-清晰度控制的是 H3 商品候选画布大小。最终成片保持上传视频的原始分辨率和时长；模型仍然使用 24fps，采样参数默认是 `simple`、`res_multistep`、20 Steps 和 Denoise 1.0：
-
-| 清晰度 | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 21:9 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `low`（默认、最快） | 672×384 | 384×672 | 512×512 | 576×448 | 448×576 | 768×320 |
-| `standard`（均衡） | 832×480 | 480×832 | 640×640 | 736×544 | 544×736 | 960×416 |
-| `high`（最慢） | 1344×768 | 768×1344 | 1024×1024 | 1024×768 | 768×1024 | 1568×672 |
-
-生成耗时主要随总帧数、画面像素量、采样步数和参考图片数量增长。高清横屏的像素量约为低清的 4 倍，因此同一视频可能明显更慢；具体倍数还取决于显卡、显存卸载和模型加载状态。
-
-客户端“生成参数”区域支持以下设置：
-
-| 参数 | 默认值 | 可选范围 | 作用 |
-| --- | --- | --- | --- |
-| Scheduler | `simple` | `simple`、`normal`、`karras`、`exponential`、`sgm_uniform` | 安排每一步的噪声强度 |
-| Sampler | `res_multistep` | `res_multistep`、`euler`、`euler_ancestral`、`heun`、`dpmpp_2m`、`dpmpp_2m_sde` | 计算每一步如何更新视频潜空间 |
-| Steps | `20` | 1–100 | 采样步数；通常越高越慢 |
-| Denoise | `1.0` | 0.01–1.00 | 生成变化强度；越低越接近输入 |
-
-`simple + res_multistep + 20 + 1.0` 是本项目原始 MiniMax-H3 工作流参数。需要更保守的商品变化时，可先测试 Denoise `0.85`；修改 Sampler 或 Scheduler 后应先用短视频检查运动稳定性。
-
-## 模型清单
-
-当前精准链路实际使用以下权重。大小按官方发布文件计算，页面显示值可能因 GB/GiB 换算略有差异。
-
-| 环节 | 模型文件 | 约占用 |
-| --- | --- | ---: |
-| H3 视频扩散 | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 21.0 GB |
-| H3 文本编码 | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | 15.7 GB |
-| H3 视频 VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | 2.81 GB |
-| H3 音频 VAE | `minimax_h3_audio_vae_fp32.safetensors` | 605 MB |
-| 商品蒙版跟踪 | `sam2.1_hiera_small.pt` | 184 MB |
-| 商品首帧识别 | `Florence-2-base-ft/model.safetensors` | 463 MB |
-| FaceFusion 换脸 | `inswapper_128_fp16.onnx` | 264.8 MiB |
-| FaceFusion 人脸检测 | `yoloface_8n.onnx` | 12.1 MiB |
-| FaceFusion 关键点 | `2dfan4.onnx`、`fan_68_5.onnx` | 94.3 MiB |
-| FaceFusion 人脸识别 | `arcface_w600k_r50.onnx` | 166.3 MiB |
-| FaceFusion 遮挡与区域蒙版 | `xseg_1.onnx`、`bisenet_resnet_34.onnx` | 156.4 MiB |
-| FaceFusion 公共检查模型 | `nsfw_1/2/3.onnx`、`fairface.onnx`、`kim_vocal_2.onnx` | 584.6 MiB |
-
-H3 四个文件合计约 40.1 GB；SAM2 约 184 MB；Florence-2 权重约 463 MB；本项目指定的 FaceFusion 必需模型合计约 1.25 GiB。PyTorch、CUDA 和 ONNX Runtime 属于运行环境，不在上表的模型大小内。已确认的 AutoDL 模型广场路径和全部加载命令统一放在第 3 节。
-
-商品自动定位使用微软发布的 [`microsoft/Florence-2-base-ft`](https://huggingface.co/microsoft/Florence-2-base-ft)。安装脚本只下载 safetensors 权重及运行所需的配置、处理器和分词器文件，不会同时下载重复的 `pytorch_model.bin`。
-
-## 部署结构（先看）
+## 部署结构
 
 服务器上包含三个相互配合的部分：
 
@@ -246,19 +155,7 @@ grep '^H3_COMFYUI' .env
 scripts/install_client_only.sh
 ```
 
-这一步不会下载、复制或重新安装 ComfyUI。`install_client_only.sh` 只创建本项目的 `.venv`、安装 FastAPI 等客户端依赖，并检查现有 ComfyUI 是否包含 MiniMax-H3 节点。不要运行 `scripts/install_autodl.sh`，也不要运行镜像根目录的 `/root/start.sh`。
-
-检查镜像是否包含 MiniMax-H3 原生节点：
-
-```bash
-grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
-  'MiniMaxH3ReferenceToVideo' \
-  /root/ComfyUI/comfy /root/ComfyUI/comfy_extras \
-  && echo 'MiniMax-H3 节点正常：保持原版本，继续第 3 节' \
-  || echo '缺少 H3 节点：不要修改 /root/ComfyUI，改用第 2.2 节'
-```
-
-检测正常就直接跳到第 3 节，不要执行 `git pull`。如果缺少 H3 节点，执行第 2.2 节，在数据盘安装独立的 ComfyUI，原来的 `/root/ComfyUI` 保持不变。
+这一步只安装工作台自身依赖，不下载、复制或更新 ComfyUI。不要运行 `scripts/install_autodl.sh`、`git pull` 或镜像根目录的 `/root/start.sh`。安装完成后继续第 3 节。
 
 ### 2.2 没有 ComfyUI，或不修改镜像自带版本
 
@@ -357,36 +254,6 @@ scripts/install_precision_tools.sh
 )
 ```
 
-这组命令在独立子进程中执行；任意路径不存在或某一步失败时会立即停止，但不会退出当前 SSH 终端。四个 H3 权重会以软链接加载到 ComfyUI，SAM2 直接读取公共文件。Florence-2 公共路径如果是完整模型目录，安装脚本会挂载其中的文件；如果是单个 safetensors 权重文件，脚本会挂载权重，并只下载体积很小的配置、处理器和分词器文件。463 MB 的 Florence-2 权重不会再重复下载。
-
-安装脚本会递归查找 Florence-2 公共目录，完整目录可以完全离线复用。如果公共路径只有单个权重，仍需联网补齐配置和分词器；脚本会先显示下载说明，并在默认 60 秒后停止，不会无限卡住。需要使用可访问镜像时，可在 `.env` 设置：
-
-```bash
-H3_HF_ENDPOINT=https://hf-mirror.com
-H3_HF_DOWNLOAD_TIMEOUT=60
-```
-
-`RequestsDependencyWarning` 只是 requests 的版本提示，不是安装失败。出现该提示后长时间没有进度，通常表示服务器正在等待 Hugging Face 连接。
-
-FaceFusion 的模型广场路径尚未提供，因此最后一步会下载项目需要的约 1.25 GiB ONNX 文件。如果以后找到了包含这些 ONNX 文件的公共目录，可以先把 `H3_FACEFUSION_MODELS_DIR=/.autodl/公共模型实际目录` 写入 `.env`，安装脚本就会优先复用。不要手工运行 FaceFusion 的 `force-download`，否则会下载当前版本提供的全部模型。
-
-FaceFusion 模型来自 GitHub Release。下载器会保留 `.part` 临时文件、断点续传、显示 MB 进度，并默认重试 8 次。AutoDL 连接 GitHub 不稳定时，先启用平台内置的学术资源加速，再重新执行安装脚本：
-
-```bash
-source /etc/network_turbo
-cd /root/autodl-tmp/comfyui-video-studio
-scripts/install_precision_tools.sh
-unset http_proxy https_proxy
-```
-
-如果当前地区没有 `/etc/network_turbo`，也可在 `.env` 填写支持“代理前缀 + 原始 GitHub URL”格式的地址，例如：
-
-```bash
-H3_GITHUB_PROXY=https://ghfast.top
-H3_FACEFUSION_DOWNLOAD_RETRIES=8
-```
-
-下载得到的 ONNX 会按照 FaceFusion 提供的 `.hash` 文件执行 SHA-256 校验；已经完整的模型直接跳过。
 
 ## 4. 切换到 GPU 模式并启动
 
@@ -609,43 +476,3 @@ open http://127.0.0.1:16006
 ssh -CNg -L 6006:127.0.0.1:6006 root@你的AutoDL主机 -p SSH端口
 open http://127.0.0.1:6006
 ```
-
-## 8. Excel 批量格式
-
-在网页中点击“下载 Excel 模板”。`任务`工作表每行一个任务：
-
-| 列 | 必填 | 含义 |
-| --- | --- | --- |
-| `upload_video_url` | 是 | 用户自行提供的公开视频 URL；不能短于 4 秒，超过 15 秒会自动分段生成并合并 |
-| `reference_image_urls` | 否 | 用户自行提供的参考图片 URL，每行一个，最多 9 个 |
-| `reference_roles` | 有参考图时是 | 与图片 URL 逐行对应；脸部图填 `face`，商品图填 `product` |
-| `product_box` | 否 | AI 默认自动定位；识别不准时可填写首帧原商品框的归一化坐标 `x1,y1,x2,y2` |
-| `prompt` | 否 | 商品外观或局部合成要求；写清“人物身上的上衣”等目标可提高自动定位准确率 |
-| `aspect_ratio` | 否 | `auto`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 或 `21:9` |
-| `quality` | 否 | `low`、`standard` 或 `high`，默认 `low` |
-| `seed` | 否 | 随机种子，留空时自动生成 |
-| `scheduler` | 否 | `simple`、`normal`、`karras`、`exponential` 或 `sgm_uniform`，默认 `simple` |
-| `sampler` | 否 | `res_multistep`、`euler`、`euler_ancestral`、`heun`、`dpmpp_2m` 或 `dpmpp_2m_sde` |
-| `steps` | 否 | 1–100，默认 `20` |
-| `denoise` | 否 | 0.01–1.00，默认 `1.0` |
-
-URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接访问。临时过期、需要登录或禁止外链的 URL 无法使用。
-
-`product_box` 可以留空。系统会先从提示词判断上衣、包、鞋等目标；提示词没有写明时，再从商品参考图判断，并自动定位视频首帧中的原商品。识别不准时才填写该列，例如 `0.42,0.46,0.72,0.88` 表示左上角在画面的 42%/46%，右下角在 72%/88%。网页上传可点击视频预览下方的“修正商品区域”拖框。
-
-## 9. 目录与端口
-
-- 客户端和任务 API：`6006`
-- ComfyUI 节点和 API：`6008`
-- GPU 与运行状态接口：`/api/system/status`
-- 项目目录：`/root/autodl-tmp/comfyui-video-studio`
-- 工作台数据：`/root/autodl-tmp/h3-studio-data`
-- 镜像自带的 ComfyUI：`/root/ComfyUI`
-- 第 2.2 节自行安装的 ComfyUI：`/root/autodl-tmp/ComfyUI`
-- 安装下载缓存：`/root/autodl-tmp/.cache/uv`
-- Florence-2、SAM2 与 FaceFusion：`/root/autodl-tmp/h3-precision-tools`
-- 队列数据库：`$H3_STUDIO_DATA_DIR/studio.db`
-- 生成结果：`$H3_STUDIO_DATA_DIR/outputs`
-- ComfyUI 工作流：`workflows/minimax_h3_ref2va_api.json`
-
-应用保持一个队列 worker，Uvicorn 必须使用 `--workers 1`。任务素材提交给 ComfyUI 后会从 ComfyUI input 临时目录清理，原始上传文件仍保留在工作台数据目录中，以便失败后重试。

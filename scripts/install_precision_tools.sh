@@ -34,7 +34,7 @@ SAM2_CHECKPOINT="${H3_SAM2_CHECKPOINT:-$TOOLS_DIR/models/sam2.1_hiera_small.pt}"
 FLORENCE2_MODEL="${H3_FLORENCE2_MODEL:-$TOOLS_DIR/models/Florence-2-base-ft}"
 FLORENCE2_MODEL_ID="${H3_FLORENCE2_MODEL_ID:-microsoft/Florence-2-base-ft}"
 FLORENCE2_PUBLIC_PATH="${H3_FLORENCE2_PUBLIC_PATH:-}"
-HF_ENDPOINT_URL="${H3_HF_ENDPOINT:-https://huggingface.co}"
+HF_ENDPOINT_URL="${H3_HF_ENDPOINT:-https://hf-mirror.com}"
 HF_DOWNLOAD_TIMEOUT="${H3_HF_DOWNLOAD_TIMEOUT:-60}"
 
 mkdir -p "$TOOLS_DIR"
@@ -133,7 +133,10 @@ else
     timeout "$HF_DOWNLOAD_TIMEOUT" \
     "$SAM2_ENV/bin/python" -c "import os; from pathlib import Path; from huggingface_hub import snapshot_download; target=Path(os.environ['FLORENCE2_LOCAL_DIR']); patterns=['*.json', '*.txt', '*.py', '*.model']; patterns += [] if (target / 'model.safetensors').is_file() else ['*.safetensors']; snapshot_download(repo_id=os.environ['FLORENCE2_REPO_ID'], local_dir=target, allow_patterns=patterns)"; then
     echo "Florence-2 配套文件下载失败或超时。公共路径只有权重时，仍需要少量配置和分词器文件。" >&2
-    echo "可在 .env 设置可访问的 H3_HF_ENDPOINT 后重试，例如 https://hf-mirror.com。" >&2
+    echo "请执行以下命令切换镜像后重试：" >&2
+    echo "  sed -i '/^H3_HF_ENDPOINT=/d' .env" >&2
+    echo "  echo 'H3_HF_ENDPOINT=https://hf-mirror.com' >> .env" >&2
+    echo "  scripts/install_precision_tools.sh" >&2
     exit 1
   fi
 fi
