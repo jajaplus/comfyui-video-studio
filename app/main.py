@@ -87,6 +87,15 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_GB * 1024**3
 MAX_SEGMENT_SECONDS = 15.0
 MIN_VIDEO_SECONDS = 4.0
 QUALITY_LEVELS = {"low", "standard", "high"}
+SAMPLER_NAMES = {
+    "res_multistep", "euler", "euler_ancestral", "heun",
+    "dpmpp_2m", "dpmpp_2m_sde",
+}
+SCHEDULER_NAMES = {"simple", "normal", "karras", "exponential", "sgm_uniform"}
+DEFAULT_SAMPLER = "res_multistep"
+DEFAULT_SCHEDULER = "simple"
+DEFAULT_STEPS = 20
+DEFAULT_DENOISE = 1.0
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -155,7 +164,11 @@ def init_db() -> None:
                 output_height INTEGER,
                 reference_roles TEXT,
                 product_box TEXT,
-                precision_mode INTEGER NOT NULL DEFAULT 1
+                precision_mode INTEGER NOT NULL DEFAULT 1,
+                sampler TEXT NOT NULL DEFAULT 'res_multistep',
+                scheduler TEXT NOT NULL DEFAULT 'simple',
+                steps INTEGER NOT NULL DEFAULT 20,
+                denoise REAL NOT NULL DEFAULT 1.0
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_queue
                 ON tasks(status, deleted_at, created_at);
@@ -183,6 +196,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN product_box TEXT")
         if "precision_mode" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN precision_mode INTEGER NOT NULL DEFAULT 0")
+        if "sampler" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN sampler TEXT NOT NULL DEFAULT 'res_multistep'")
+        if "scheduler" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN scheduler TEXT NOT NULL DEFAULT 'simple'")
+        if "steps" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN steps INTEGER NOT NULL DEFAULT 20")
+        if "denoise" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN denoise REAL NOT NULL DEFAULT 1.0")
         conn.execute(
             "UPDATE tasks SET status='queued', progress=0, stage='等待队列', started_at=NULL, "
             "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
@@ -210,12 +231,24 @@ def segment_durations(duration: float) -> list[float]:
     return parts
 
 
-def validate_task_values(duration: float, aspect_ratio: str, quality: str = "low") -> None:
+def validate_task_values(
+    duration: float, aspect_ratio: str, quality: str = "low",
+    sampler: str = DEFAULT_SAMPLER, scheduler: str = DEFAULT_SCHEDULER,
+    steps: int = DEFAULT_STEPS, denoise: float = DEFAULT_DENOISE,
+) -> None:
     segment_durations(duration)
     if aspect_ratio not in {"auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}:
         raise ValueError("不支持的画面比例")
     if quality not in QUALITY_LEVELS:
         raise ValueError("不支持的视频清晰度")
+    if sampler not in SAMPLER_NAMES:
+        raise ValueError("不支持的 Sampler")
+    if scheduler not in SCHEDULER_NAMES:
+        raise ValueError("不支持的 Scheduler")
+    if not 1 <= int(steps) <= 100:
+        raise ValueError("Steps 必须在 1–100 之间")
+    if not math.isfinite(float(denoise)) or not 0.01 <= float(denoise) <= 1:
+        raise ValueError("Denoise 必须在 0.01–1.00 之间")
 
 
 def is_http_url(value: str) -> bool:
@@ -311,9 +344,13 @@ def insert_task(
     *, prompt: str, source_video: str | Path, reference_images: list[str | Path], duration: float,
     aspect_ratio: str, seed: int | None, quality: str = "low", display_name: str | None = None,
     reference_roles: list[str] | None = None, product_box: list[float] | None = None,
-    precision_mode: bool = True,
+    precision_mode: bool = True, sampler: str = DEFAULT_SAMPLER,
+    scheduler: str = DEFAULT_SCHEDULER, steps: int = DEFAULT_STEPS,
+    denoise: float = DEFAULT_DENOISE,
 ) -> str:
-    validate_task_values(duration, aspect_ratio, quality)
+    steps = int(steps)
+    denoise = float(denoise)
+    validate_task_values(duration, aspect_ratio, quality, sampler, scheduler, steps, denoise)
     source_text = str(source_video)
     if is_http_url(source_text):
         validate_public_media_url(source_text, "upload_video_url")
@@ -355,8 +392,9 @@ def insert_task(
             """INSERT INTO tasks (
                 id,name,status,prompt,source_video,reference_images,
                 duration,aspect_ratio,source_start,seed,stage,segment_count,current_segment,quality,
-                reference_roles,product_box,precision_mode,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                reference_roles,product_box,precision_mode,sampler,scheduler,steps,denoise,
+                created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, name or f"视频-{task_id[:6]}", "queued", prompt.strip(),
                 source_text, json.dumps([str(path) for path in reference_images], ensure_ascii=False),
@@ -364,6 +402,7 @@ def insert_task(
                 json.dumps(roles, ensure_ascii=False),
                 json.dumps(product_box) if product_box is not None else None,
                 1 if precision_mode else 0,
+                sampler, scheduler, steps, denoise,
                 now, now,
             ),
         )
@@ -738,6 +777,12 @@ def build_comfy_workflow(row: sqlite3.Row, source_upload: str, reference_uploads
     sampler["height"] = height
     workflow["132"]["inputs"]["value"] = float(row["duration"])
     workflow["129"]["inputs"]["noise_seed"] = int(row["seed"])
+    workflow["123"]["inputs"]["sampler_name"] = str(row["sampler"] or DEFAULT_SAMPLER)
+    workflow["124"]["inputs"]["scheduler"] = str(row["scheduler"] or DEFAULT_SCHEDULER)
+    workflow["124"]["inputs"]["steps"] = int(row["steps"] or DEFAULT_STEPS)
+    workflow["124"]["inputs"]["denoise"] = float(
+        row["denoise"] if row["denoise"] is not None else DEFAULT_DENOISE
+    )
     workflow["138"]["inputs"]["value"] = build_h3_prompt(row)
     workflow["92"]["inputs"]["filename_prefix"] = f"h3_studio/{row['id']}"
     workflow["127"]["inputs"]["unet_name"] = COMFYUI_UNET
@@ -1392,6 +1437,12 @@ def config() -> dict[str, Any]:
         "long_video_split": True,
         "default_quality": "low",
         "quality_dimensions": QUALITY_DIMENSIONS,
+        "samplers": sorted(SAMPLER_NAMES),
+        "schedulers": sorted(SCHEDULER_NAMES),
+        "default_sampler": DEFAULT_SAMPLER,
+        "default_scheduler": DEFAULT_SCHEDULER,
+        "default_steps": DEFAULT_STEPS,
+        "default_denoise": DEFAULT_DENOISE,
     }
 
 
@@ -1423,6 +1474,10 @@ async def create_manual_task(
     aspect_ratio: Annotated[str, Form()] = "auto",
     quality: Annotated[str, Form()] = "low",
     seed: Annotated[int | None, Form()] = None,
+    sampler: Annotated[str, Form()] = DEFAULT_SAMPLER,
+    scheduler: Annotated[str, Form()] = DEFAULT_SCHEDULER,
+    steps: Annotated[int, Form()] = DEFAULT_STEPS,
+    denoise: Annotated[float, Form()] = DEFAULT_DENOISE,
     video_durations: Annotated[str, Form()] = "[]",
     reference_roles: Annotated[str, Form()] = "[]",
     product_boxes: Annotated[str, Form()] = "[]",
@@ -1476,7 +1531,9 @@ async def create_manual_task(
             precision_mode = False
         elif saved_references and len(parsed_roles) != len(saved_references):
             raise ValueError("请为每张参考图片选择“脸部”或“商品”")
-        validate_task_values(prepared[0][2], aspect_ratio, quality)
+        validate_task_values(
+            prepared[0][2], aspect_ratio, quality, sampler, scheduler, steps, denoise
+        )
         for video_index, (saved_video, original_name, duration) in enumerate(prepared):
             product_box = parsed_boxes[video_index] if video_index < len(parsed_boxes) else None
             created.append(insert_task(
@@ -1484,6 +1541,7 @@ async def create_manual_task(
                 duration=duration, aspect_ratio=aspect_ratio, seed=seed, quality=quality,
                 display_name=original_name, reference_roles=parsed_roles,
                 product_box=product_box, precision_mode=precision_mode,
+                sampler=sampler, scheduler=scheduler, steps=steps, denoise=denoise,
             ))
         return {"created": len(created), "task_ids": created, "status": "queued"}
     except HTTPException:
@@ -1506,6 +1564,12 @@ def int_cell(value: Any, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
     return int(float(value))
+
+
+def float_cell(value: Any, default: float) -> float:
+    if value is None or str(value).strip() == "":
+        return default
+    return float(value)
 
 
 @app.post("/api/tasks/import", status_code=201)
@@ -1566,11 +1630,18 @@ async def import_excel_tasks(
                 aspect_ratio = text_cell(cell("aspect_ratio")) or "auto"
                 quality = text_cell(cell("quality")) or "low"
                 seed = int_cell(cell("seed"), None)
+                scheduler = text_cell(cell("scheduler")) or DEFAULT_SCHEDULER
+                sampler = text_cell(cell("sampler")) or DEFAULT_SAMPLER
+                steps = int_cell(cell("steps"), DEFAULT_STEPS)
+                denoise = float_cell(cell("denoise"), DEFAULT_DENOISE)
                 task_id = insert_task(
                     prompt=text_cell(cell("prompt")), source_video=source_url,
                     reference_images=reference_urls, duration=duration, aspect_ratio=aspect_ratio,
                     seed=seed, quality=quality, display_name=media_display_name(source_url),
                     reference_roles=reference_roles, product_box=product_box, precision_mode=True,
+                    scheduler=scheduler, sampler=sampler,
+                    steps=steps if steps is not None else DEFAULT_STEPS,
+                    denoise=denoise,
                 )
                 created.append(task_id)
             except Exception as exc:
@@ -1650,13 +1721,15 @@ def excel_template() -> StreamingResponse:
     headers = [
         "upload_video_url", "reference_image_urls", "reference_roles", "product_box",
         "prompt", "aspect_ratio", "quality", "seed",
+        "scheduler", "sampler", "steps", "denoise",
     ]
     sheet.append(headers)
     sheet.append([
         "https://your-domain.example/videos/source.mp4",
         "https://your-domain.example/images/person.jpg\nhttps://your-domain.example/images/product.png",
         "face\nproduct", "",
-        "将视频中的人物脸部换成参考图1，人物身上的上衣换成参考图2，并保持手部遮挡自然。", "auto", "low", "",
+        "将视频中的人物脸部换成参考图1，人物身上的上衣换成参考图2，并保持手部遮挡自然。",
+        "auto", "low", "", "simple", "res_multistep", 20, 1.0,
     ])
     header_fill = PatternFill("solid", fgColor="253449")
     for cell in sheet[1]:
@@ -1667,11 +1740,11 @@ def excel_template() -> StreamingResponse:
         cell.fill = PatternFill("solid", fgColor="FFF4CC")
         cell.alignment = Alignment(vertical="top", wrap_text=True)
     sheet.row_dimensions[2].height = 38
-    widths = [52, 62, 24, 28, 62, 18, 18, 18]
+    widths = [52, 62, 24, 28, 62, 18, 18, 18, 20, 22, 14, 14]
     for i, width in enumerate(widths, start=1):
         sheet.column_dimensions[chr(64 + i)].width = width
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:H2"
+    sheet.auto_filter.ref = "A1:L2"
     sheet["A1"].comment = Comment(
         "必填；用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。",
         "MiniMax H3 Studio",
@@ -1680,12 +1753,28 @@ def excel_template() -> StreamingResponse:
     sheet["C1"].comment = Comment("有参考图时必填；与图片逐行对应，只能填 face 或 product。", "MiniMax H3 Studio")
     sheet["D1"].comment = Comment("可选；AI 默认根据提示词和商品参考图定位。识别不准时填写首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "MiniMax H3 Studio")
     sheet["G1"].comment = Comment("可选；low、standard 或 high。默认 low，速度最快。", "MiniMax H3 Studio")
+    sheet["I1"].comment = Comment("可选；噪声调度器，默认 simple。", "MiniMax H3 Studio")
+    sheet["J1"].comment = Comment("可选；采样器，默认 res_multistep。", "MiniMax H3 Studio")
+    sheet["K1"].comment = Comment("可选；采样步数 1–100，默认 20。", "MiniMax H3 Studio")
+    sheet["L1"].comment = Comment("可选；生成变化强度 0.01–1.00，默认 1.0。", "MiniMax H3 Studio")
     ratio_validation = DataValidation(type="list", formula1='"auto,16:9,9:16,1:1,4:3,3:4,21:9"')
     sheet.add_data_validation(ratio_validation)
     ratio_validation.add("F2:F1000")
     quality_validation = DataValidation(type="list", formula1='"low,standard,high"')
     sheet.add_data_validation(quality_validation)
     quality_validation.add("G2:G1000")
+    scheduler_validation = DataValidation(type="list", formula1='"simple,normal,karras,exponential,sgm_uniform"')
+    sheet.add_data_validation(scheduler_validation)
+    scheduler_validation.add("I2:I1000")
+    sampler_validation = DataValidation(type="list", formula1='"res_multistep,euler,euler_ancestral,heun,dpmpp_2m,dpmpp_2m_sde"')
+    sheet.add_data_validation(sampler_validation)
+    sampler_validation.add("J2:J1000")
+    steps_validation = DataValidation(type="whole", operator="between", formula1="1", formula2="100")
+    sheet.add_data_validation(steps_validation)
+    steps_validation.add("K2:K1000")
+    denoise_validation = DataValidation(type="decimal", operator="between", formula1="0.01", formula2="1")
+    sheet.add_data_validation(denoise_validation)
+    denoise_validation.add("L2:L1000")
 
     guide = workbook.create_sheet("字段说明")
     guide.append(["字段", "是否必填", "说明"])
@@ -1698,6 +1787,10 @@ def excel_template() -> StreamingResponse:
         ("aspect_ratio", "否", "默认 auto，跟随上传视频比例；也可指定固定比例。"),
         ("quality", "否", "清晰度：low（低清，默认且最快）、standard（标清）或 high（高清且最慢）。"),
         ("seed", "否", "固定随机种子便于复现；空白时自动生成。"),
+        ("scheduler", "否", "噪声调度器：simple（默认）、normal、karras、exponential 或 sgm_uniform。"),
+        ("sampler", "否", "采样器：res_multistep（默认）、euler、euler_ancestral、heun、dpmpp_2m 或 dpmpp_2m_sde。"),
+        ("steps", "否", "采样步数 1–100，默认 20；通常越高越慢。"),
+        ("denoise", "否", "生成变化强度 0.01–1.00，默认 1.0；越低越接近输入。"),
     ]
     for row in guide_rows:
         guide.append(row)

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+FORCE_INSTALL=0
+UPDATE_SOURCES="${H3_UPDATE_PRECISION_TOOLS:-0}"
+for argument in "$@"; do
+  case "$argument" in
+    --force) FORCE_INSTALL=1 ;;
+    --update-sources) UPDATE_SOURCES=1 ;;
+    *) echo "未知参数：$argument（支持 --force、--update-sources）" >&2; exit 2 ;;
+  esac
+done
+
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 if [[ -f .env ]]; then
@@ -44,21 +54,30 @@ fi
 
 if [ ! -d "$SAM2_DIR/.git" ]; then
   git clone --depth 1 https://github.com/facebookresearch/sam2.git "$SAM2_DIR"
-else
+elif [ "$UPDATE_SOURCES" = "1" ]; then
   git -C "$SAM2_DIR" pull --ff-only
+else
+  echo "复用 SAM2 源码：$SAM2_DIR"
 fi
 
 if [ ! -x "$SAM2_ENV/bin/python" ]; then
   "$BASE_PYTHON" -m venv --system-site-packages "$SAM2_ENV"
 fi
-"$SAM2_ENV/bin/python" -m pip install --upgrade pip
-"$SAM2_ENV/bin/python" -m pip install \
-  -e "$SAM2_DIR" \
-  opencv-python-headless \
-  huggingface_hub \
-  'transformers==4.49.0' \
-  timm \
-  einops
+if [ "$FORCE_INSTALL" = "1" ] || ! "$SAM2_ENV/bin/python" -c \
+  "import cv2, einops, huggingface_hub, sam2, timm, transformers; assert transformers.__version__ == '4.49.0'" \
+  >/dev/null 2>&1; then
+  echo "安装 SAM2 与 Florence-2 Python 依赖（仅首次安装或环境不完整时执行）"
+  "$SAM2_ENV/bin/python" -m pip install --upgrade pip
+  "$SAM2_ENV/bin/python" -m pip install \
+    -e "$SAM2_DIR" \
+    opencv-python-headless \
+    huggingface_hub \
+    'transformers==4.49.0' \
+    timm \
+    einops
+else
+  echo "复用 SAM2 与 Florence-2 Python 环境：$SAM2_ENV"
+fi
 if [ -f "$SAM2_CHECKPOINT" ]; then
   echo "复用 SAM2 权重：$SAM2_CHECKPOINT"
 else
@@ -93,12 +112,14 @@ else
 fi
 
 if [ ! -d "$FACEFUSION_DIR/.git" ]; then
-  git clone --depth 1 https://github.com/facefusion/facefusion.git "$FACEFUSION_DIR"
+  git clone --depth 1 --branch "$FACEFUSION_VERSION" \
+    https://github.com/facefusion/facefusion.git "$FACEFUSION_DIR"
+elif [ "$UPDATE_SOURCES" = "1" ]; then
+  git -C "$FACEFUSION_DIR" fetch --tags --force
+  git -C "$FACEFUSION_DIR" checkout --force "$FACEFUSION_VERSION"
 else
   echo "复用 FaceFusion 源码：$FACEFUSION_DIR"
 fi
-git -C "$FACEFUSION_DIR" fetch --tags --force
-git -C "$FACEFUSION_DIR" checkout --force "$FACEFUSION_VERSION"
 
 CONDA_BIN=/root/miniconda3/bin/conda
 if [ ! -x "$CONDA_BIN" ]; then
@@ -108,12 +129,21 @@ fi
 if [ ! -x "$FACEFUSION_ENV/bin/python" ]; then
   "$CONDA_BIN" create -y -p "$FACEFUSION_ENV" python=3.12 pip=25.0
 fi
-(
+if [ "$FORCE_INSTALL" = "1" ] || ! (
   cd "$FACEFUSION_DIR"
-  "$CONDA_BIN" run --no-capture-output \
-    -p "$FACEFUSION_ENV" \
-    python install.py cuda@12
-)
+  "$FACEFUSION_ENV/bin/python" -c "import cv2, numpy, onnxruntime" >/dev/null 2>&1
+  "$FACEFUSION_ENV/bin/python" facefusion.py --version >/dev/null 2>&1
+); then
+  echo "安装 FaceFusion Python 依赖（仅首次安装或环境不完整时执行）"
+  (
+    cd "$FACEFUSION_DIR"
+    "$CONDA_BIN" run --no-capture-output \
+      -p "$FACEFUSION_ENV" \
+      python install.py cuda@12
+  )
+else
+  echo "复用 FaceFusion Python 环境：$FACEFUSION_ENV"
+fi
 
 PREFETCH_ARGUMENTS=(
   --facefusion-dir "$FACEFUSION_DIR"
@@ -123,4 +153,4 @@ if [[ -n "${H3_FACEFUSION_MODELS_DIR:-}" ]]; then
 fi
 "$FACEFUSION_ENV/bin/python" "$PROJECT_DIR/scripts/prefetch_facefusion_models.py" "${PREFETCH_ARGUMENTS[@]}"
 
-echo "Florence-2、SAM2 和 FaceFusion 已安装到 $TOOLS_DIR"
+echo "Florence-2、SAM2 和 FaceFusion 已准备完成：$TOOLS_DIR"

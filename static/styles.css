@@ -90,6 +90,10 @@ input[type=file]::file-selector-button { color: #092019; background: var(--mint)
 .required > .file-label::after { content: "*"; color: var(--amber); }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .three-col { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 12px; }
+.four-col { display: grid; grid-template-columns: 1fr 1.35fr .7fr .8fr; gap: 12px; }
+.generation-settings { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(9, 21, 30, .45); }
+.generation-settings h3 { margin: 0 0 4px; font-size: 15px; }
+.generation-settings p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .resolution-hint { margin: -9px 0 0; color: var(--mint); font-size: 12px; font-weight: 700; }
 .prompt-help { margin: -10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 details { border-top: 1px solid var(--line); padding-top: 14px; }
@@ -154,7 +158,7 @@ dialog p { color: var(--muted); font-size: 13px; }
   .topbar { flex-direction: column; }
   .stats { grid-template-columns: 1fr 1fr; }
   .gpu-metrics { grid-template-columns: 1fr; }
-  .two-col, .three-col { grid-template-columns: 1fr; }
+  .two-col, .three-col, .four-col { grid-template-columns: 1fr; }
   .media-preview { grid-template-columns: 1fr; }
   .task { grid-template-columns: 1fr; }
   .task-actions { justify-content: flex-end; }

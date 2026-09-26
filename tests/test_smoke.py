@@ -43,6 +43,7 @@ class StudioSmokeTest(unittest.TestCase):
             prompt="Keep the original background.", source_video=source,
             reference_images=[person, product], duration=5.25,
             aspect_ratio="16:9", seed=42, display_name="smoke.mp4",
+            scheduler="karras", sampler="euler", steps=28, denoise=0.85,
         )
         row = self.main.claim_next_task()
         self.assertEqual(row["id"], task_id)
@@ -63,6 +64,10 @@ class StudioSmokeTest(unittest.TestCase):
                 self.assertIn("ref_images.ref_image_1", sampler)
                 self.assertEqual(sampler["width"], 672)
                 self.assertEqual(sampler["height"], 384)
+                self.assertEqual(workflow["123"]["inputs"]["sampler_name"], "euler")
+                self.assertEqual(workflow["124"]["inputs"]["scheduler"], "karras")
+                self.assertEqual(workflow["124"]["inputs"]["steps"], 28)
+                self.assertEqual(workflow["124"]["inputs"]["denoise"], 0.85)
                 return {"prompt_id": "comfy-1"}
             if "/history/comfy-1" in url:
                 return {"comfy-1": {
@@ -132,6 +137,12 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertIsNone(template["任务"]["D2"].value)
         self.assertEqual(template["任务"]["G1"].value, "quality")
         self.assertEqual(template["任务"]["G2"].value, "low")
+        self.assertEqual(template["任务"]["I1"].value, "scheduler")
+        self.assertEqual(template["任务"]["I2"].value, "simple")
+        self.assertEqual(template["任务"]["J1"].value, "sampler")
+        self.assertEqual(template["任务"]["J2"].value, "res_multistep")
+        self.assertEqual(template["任务"]["K2"].value, 20)
+        self.assertEqual(template["任务"]["L2"].value, 1.0)
         self.assertGreater(len(template["任务"].data_validations.dataValidation), 0)
 
     def test_03_manual_multiple_videos(self) -> None:
@@ -154,13 +165,18 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         with self.main.connect_db() as conn:
             rows = conn.execute(
-                "SELECT name,duration,reference_images,quality FROM tasks WHERE id IN (?,?) ORDER BY name",
+                "SELECT name,duration,reference_images,quality,scheduler,sampler,steps,denoise "
+                "FROM tasks WHERE id IN (?,?) ORDER BY name",
                 result["task_ids"],
             ).fetchall()
         self.assertEqual([row["name"] for row in rows], ["one", "two"])
         self.assertEqual([row["duration"] for row in rows], [5.2, 8.4])
         self.assertTrue(all(len(json.loads(row["reference_images"])) == 2 for row in rows))
         self.assertTrue(all(row["quality"] == "low" for row in rows))
+        self.assertTrue(all(row["scheduler"] == "simple" for row in rows))
+        self.assertTrue(all(row["sampler"] == "res_multistep" for row in rows))
+        self.assertTrue(all(row["steps"] == 20 for row in rows))
+        self.assertTrue(all(row["denoise"] == 1.0 for row in rows))
 
     def test_04_gpu_status_parser(self) -> None:
         parsed = self.main.parse_nvidia_smi(

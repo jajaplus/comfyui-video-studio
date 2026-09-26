@@ -17,6 +17,7 @@
 - 超过 15 秒的视频会切成多个长度接近的 4–15 秒片段，依次生成后自动合并成一个视频。
 - 生成总时长跟随上传视频，画面比例默认跟随视频方向。
 - 视频清晰度支持低清、标清和高清三档，默认低清以缩短生成时间。
+- Scheduler、Sampler、Steps 和 Denoise 可在客户端逐任务设置，任务列表显示实际参数。
 - Excel 一次最多导入 3 个任务，素材 URL 由用户自行填写。
 - SQLite 持久化队列，支持查看进度、下载、失败重试和删除任务。
 - 客户端每 3 秒刷新 GPU 利用率、显存、温度和功耗。
@@ -48,7 +49,7 @@
 
 长视频的每个片段由模型独立生成，因此片段连接处可能出现轻微的画面、人物细节或声音跳变。任务列表会显示总片段数、当前片段和整体进度；任意片段失败时可直接重试整个任务。
 
-清晰度控制的是 H3 商品候选画布大小。最终成片保持上传视频的原始分辨率和时长；模型仍然使用 24fps 和 20 个采样步骤：
+清晰度控制的是 H3 商品候选画布大小。最终成片保持上传视频的原始分辨率和时长；模型仍然使用 24fps，采样参数默认是 `simple`、`res_multistep`、20 Steps 和 Denoise 1.0：
 
 | 清晰度 | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 21:9 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -57,6 +58,17 @@
 | `high`（最慢） | 1344×768 | 768×1344 | 1024×1024 | 1024×768 | 768×1024 | 1568×672 |
 
 生成耗时主要随总帧数、画面像素量、采样步数和参考图片数量增长。高清横屏的像素量约为低清的 4 倍，因此同一视频可能明显更慢；具体倍数还取决于显卡、显存卸载和模型加载状态。
+
+客户端“生成参数”区域支持以下设置：
+
+| 参数 | 默认值 | 可选范围 | 作用 |
+| --- | --- | --- | --- |
+| Scheduler | `simple` | `simple`、`normal`、`karras`、`exponential`、`sgm_uniform` | 安排每一步的噪声强度 |
+| Sampler | `res_multistep` | `res_multistep`、`euler`、`euler_ancestral`、`heun`、`dpmpp_2m`、`dpmpp_2m_sde` | 计算每一步如何更新视频潜空间 |
+| Steps | `20` | 1–100 | 采样步数；通常越高越慢 |
+| Denoise | `1.0` | 0.01–1.00 | 生成变化强度；越低越接近输入 |
+
+`simple + res_multistep + 20 + 1.0` 是本项目原始 MiniMax-H3 工作流参数。需要更保守的商品变化时，可先测试 Denoise `0.85`；修改 Sampler 或 Scheduler 后应先用短视频检查运动稳定性。
 
 ## 模型清单
 
@@ -419,23 +431,23 @@ chmod +x scripts/*.sh
 
 `tar -xzf` 只覆盖压缩包中包含的同名文件，不会自动删除服务器上多余的旧文件。如果新版明确删除了某个旧程序文件，需要手工删除该旧文件。
 
-### 5.3 更新客户端依赖并重启
+### 5.3 直接重启
 
-无论使用哪一种镜像，都可以执行下面的通用更新命令：
+普通代码和页面更新不需要重新安装 ComfyUI、SAM2、Florence-2 或 FaceFusion，直接启动即可：
 
 ```bash
 cd /root/autodl-tmp/comfyui-video-studio
-
-if [ -x .venv/bin/uv ]; then
-  .venv/bin/uv pip install --python .venv/bin/python -r requirements.txt
-else
-  .venv/bin/python -m pip install -r requirements.txt
-fi
-
-# 从旧版工作台升级到 3.0 时执行一次；已安装时会复用现有环境。
-scripts/install_precision_tools.sh
 scripts/start_all.sh
 ```
+
+只有 README 明确说明“本次更新增加依赖”时，才需要更新客户端依赖：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+`scripts/install_precision_tools.sh` 只用于首次部署、加入新的精准工具依赖或修复损坏环境。脚本现在会先检查现有环境：完整时直接显示“复用”，不会执行 `pip install`、`git pull` 或 FaceFusion 安装。需要强制重装时使用 `scripts/install_precision_tools.sh --force`；需要主动更新 SAM2 和 FaceFusion 源码时使用 `scripts/install_precision_tools.sh --update-sources`。
 
 确认新版本已经正常运行：
 
@@ -507,7 +519,7 @@ fi
 
 ### 提示 Florence-2、SAM2 或 FaceFusion 未安装
 
-这是精准模式需要的三个独立工具。在 AutoDL 终端执行：
+这是精准模式需要的三个独立工具。首次安装或页面明确提示缺失时，在 AutoDL 终端执行：
 
 ```bash
 cd /root/autodl-tmp/comfyui-video-studio
@@ -525,6 +537,8 @@ scripts/start_all.sh
 ```
 
 没有配置公共路径时，首次安装会下载约 463 MB 的 Florence-2、约 184 MB 的 SAM2.1 Small 和约 1.25 GiB 的 FaceFusion 必需模型；按第 3 节配置后会直接复用 Florence-2 和 SAM2 公共权重。生成时系统会在 H3 完成后释放 ComfyUI 模型，再启动 Florence-2、SAM2 和 FaceFusion，降低同时占用显存的概率。
+
+重复执行安装脚本时，它会检查 Python 模块、模型文件和 FaceFusion 命令。全部存在就直接复用。看到 `Installing build dependencies` 说明检测到环境缺少模块、版本不匹配，或者使用了 `--force`，这时才会执行安装。
 
 ### 查看 GPU 使用情况
 
@@ -583,6 +597,10 @@ open http://127.0.0.1:6006
 | `aspect_ratio` | 否 | `auto`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 或 `21:9` |
 | `quality` | 否 | `low`、`standard` 或 `high`，默认 `low` |
 | `seed` | 否 | 随机种子，留空时自动生成 |
+| `scheduler` | 否 | `simple`、`normal`、`karras`、`exponential` 或 `sgm_uniform`，默认 `simple` |
+| `sampler` | 否 | `res_multistep`、`euler`、`euler_ancestral`、`heun`、`dpmpp_2m` 或 `dpmpp_2m_sde` |
+| `steps` | 否 | 1–100，默认 `20` |
+| `denoise` | 否 | 0.01–1.00，默认 `1.0` |
 
 URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接访问。临时过期、需要登录或禁止外链的 URL 无法使用。
 

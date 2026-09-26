@@ -431,6 +431,7 @@ function renderTasks() {
       ? `${task.output_width}×${task.output_height}`
       : (task.precision_mode ? '跟随原视频' : (presetSize ? `${presetSize[0]}×${presetSize[1]}` : '等待计算尺寸'));
     const mode = task.precision_mode ? '精准局部替换' : 'H3 整段复刻';
+    const generation = `${task.scheduler || 'simple'} / ${task.sampler || 'res_multistep'} · ${Number(task.steps || 20)} Steps · Denoise ${Number(task.denoise ?? 1).toFixed(2)}`;
     const elapsed = task.started_at
       ? `<span class="task-elapsed" data-elapsed-start="${escapeHtml(task.started_at)}" data-elapsed-finish="${escapeHtml(task.finished_at || '')}">${escapeHtml(elapsedLabel(task.started_at, task.finished_at || ''))}</span>`
       : '';
@@ -442,6 +443,7 @@ function renderTasks() {
         </div>
         <div class="task-meta">
           ${queue}<span>${formatSeconds(task.duration)} 秒${segments} · ${escapeHtml(mode)} · ${escapeHtml(quality)} ${escapeHtml(resolution)}</span>
+          <span>${escapeHtml(generation)}</span>
           <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>${elapsed}
         </div>
         ${error}
