@@ -7,6 +7,13 @@ const state = {
 };
 const videoMetadataCache = new WeakMap();
 const boxPicker = { file: null, frame: null, rect: null, start: null, objectUrl: null };
+const DRAFT_DB_NAME = 'h3-video-studio-draft';
+const DRAFT_DB_VERSION = 1;
+const DRAFT_FILES_STORE = 'files';
+const DRAFT_META_STORE = 'meta';
+let draftDatabasePromise = null;
+let draftErrorShown = false;
+let promptSaveTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
 const statusLabels = {
@@ -30,6 +37,135 @@ const qualityDimensions = {
     '4:3': [1024, 768], '3:4': [768, 1024], '21:9': [1568, 672],
   },
 };
+
+function openDraftDatabase() {
+  if (!('indexedDB' in window)) return Promise.reject(new Error('当前浏览器不支持 IndexedDB'));
+  if (draftDatabasePromise) return draftDatabasePromise;
+  draftDatabasePromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DRAFT_DB_NAME, DRAFT_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(DRAFT_FILES_STORE)) {
+        database.createObjectStore(DRAFT_FILES_STORE, { keyPath: 'id' });
+      }
+      if (!database.objectStoreNames.contains(DRAFT_META_STORE)) {
+        database.createObjectStore(DRAFT_META_STORE, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('无法打开草稿存储'));
+  });
+  return draftDatabasePromise;
+}
+
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('草稿读取失败'));
+  });
+}
+
+function transactionFinished(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error || new Error('草稿保存被中止'));
+    transaction.onerror = () => reject(transaction.error || new Error('草稿保存失败'));
+  });
+}
+
+function reportDraftError(error) {
+  console.warn('草稿保存失败', error);
+  if (draftErrorShown) return;
+  draftErrorShown = true;
+  toast('浏览器空间不足或禁止本地存储，刷新后可能无法恢复素材');
+}
+
+function draftMeta() {
+  return {
+    id: 'single-task',
+    prompt: $('#singleForm')?.elements.prompt?.value || '',
+    referenceRoles: Object.fromEntries(state.referenceRoles),
+    productBoxes: Object.fromEntries(state.productBoxes),
+  };
+}
+
+async function saveDraftFiles() {
+  const database = await openDraftDatabase();
+  const transaction = database.transaction(DRAFT_FILES_STORE, 'readwrite');
+  const store = transaction.objectStore(DRAFT_FILES_STORE);
+  store.clear();
+  state.selectedVideos.forEach((file, position) => {
+    store.put({
+      id: `video:${fileKey(file)}`, kind: 'video', position, file,
+      name: file.name, type: file.type, lastModified: file.lastModified,
+    });
+  });
+  state.selectedImages.forEach((file, position) => {
+    store.put({
+      id: `image:${fileKey(file)}`, kind: 'image', position, file,
+      name: file.name, type: file.type, lastModified: file.lastModified,
+    });
+  });
+  await transactionFinished(transaction);
+}
+
+async function saveDraftMeta() {
+  const database = await openDraftDatabase();
+  const transaction = database.transaction(DRAFT_META_STORE, 'readwrite');
+  transaction.objectStore(DRAFT_META_STORE).put(draftMeta());
+  await transactionFinished(transaction);
+}
+
+function persistDraftFiles() {
+  navigator.storage?.persist?.().catch(() => {});
+  Promise.all([saveDraftFiles(), saveDraftMeta()]).catch(reportDraftError);
+}
+
+function persistDraftMeta() {
+  saveDraftMeta().catch(reportDraftError);
+}
+
+async function clearSavedDraft() {
+  const database = await openDraftDatabase();
+  const transaction = database.transaction([DRAFT_FILES_STORE, DRAFT_META_STORE], 'readwrite');
+  transaction.objectStore(DRAFT_FILES_STORE).clear();
+  transaction.objectStore(DRAFT_META_STORE).clear();
+  await transactionFinished(transaction);
+}
+
+async function restoreSavedDraft() {
+  const database = await openDraftDatabase();
+  const transaction = database.transaction([DRAFT_FILES_STORE, DRAFT_META_STORE], 'readonly');
+  const filesRequest = transaction.objectStore(DRAFT_FILES_STORE).getAll();
+  const metaRequest = transaction.objectStore(DRAFT_META_STORE).get('single-task');
+  const [records, meta] = await Promise.all([requestResult(filesRequest), requestResult(metaRequest)]);
+  const sortedRecords = records.sort((left, right) => left.position - right.position);
+  const restoredFile = (item) => item.file instanceof File
+    ? item.file
+    : new File([item.file], item.name, { type: item.type, lastModified: item.lastModified });
+  state.selectedVideos = sortedRecords.filter((item) => item.kind === 'video').map(restoredFile).slice(0, 3);
+  state.selectedImages = sortedRecords.filter((item) => item.kind === 'image').map(restoredFile).slice(0, 9);
+  state.referenceRoles = new Map(Object.entries(meta?.referenceRoles || {}));
+  state.productBoxes = new Map(Object.entries(meta?.productBoxes || {}));
+  $('#singleForm').elements.prompt.value = meta?.prompt || '';
+  syncFileInput($('#uploadVideos'), state.selectedVideos);
+  syncFileInput($('#referenceImages'), state.selectedImages);
+  renderMediaPreview(state.selectedVideos, $('#videoPreview'), 'video');
+  renderMediaPreview(state.selectedImages, $('#imagePreview'), 'image');
+}
+
+function clearComposer() {
+  state.selectedVideos = [];
+  state.selectedImages = [];
+  state.referenceRoles.clear();
+  state.productBoxes.clear();
+  syncFileInput($('#uploadVideos'), []);
+  syncFileInput($('#referenceImages'), []);
+  $('#singleForm').elements.prompt.value = '';
+  clearMediaPreview($('#videoPreview'));
+  clearMediaPreview($('#imagePreview'));
+  updateQualityResolution();
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -222,7 +358,10 @@ function renderMediaPreview(files, container, kind) {
       role.setAttribute('aria-label', `${file.name} 的参考类型`);
       role.innerHTML = '<option value="face">脸部参考图</option><option value="product">商品参考图</option>';
       role.value = state.referenceRoles.get(fileKey(file)) || 'face';
-      role.addEventListener('change', () => state.referenceRoles.set(fileKey(file), role.value));
+      role.addEventListener('change', () => {
+        state.referenceRoles.set(fileKey(file), role.value);
+        persistDraftMeta();
+      });
       tools.append(role);
     } else {
       const selectBox = document.createElement('button');
@@ -247,6 +386,7 @@ function renderMediaPreview(files, container, kind) {
       syncFileInput(input, state[stateKey]);
       renderMediaPreview(state[stateKey], container, kind);
       if (kind === 'video') updateQualityResolution();
+      persistDraftFiles();
     });
     card.append(media, info, tools, remove);
     container.append(card);
@@ -289,6 +429,7 @@ function appendSelectedFiles(kind, input, newFiles, maxFiles, container) {
   syncFileInput(input, merged);
   renderMediaPreview(merged, container, kind);
   if (kind === 'video') updateQualityResolution();
+  persistDraftFiles();
 }
 
 function drawProductBox() {
@@ -392,6 +533,7 @@ $('#saveProductBox').addEventListener('click', () => {
   ]);
   closeProductBoxPicker();
   renderMediaPreview(state.selectedVideos, $('#videoPreview'), 'video');
+  persistDraftMeta();
 });
 
 function renderTasks() {
@@ -539,6 +681,20 @@ $('#uploadVideos').addEventListener('change', (event) => {
 $('#referenceImages').addEventListener('change', (event) => {
   appendSelectedFiles('image', event.currentTarget, [...event.currentTarget.files], 9, $('#imagePreview'));
 });
+$('#singleForm').elements.prompt.addEventListener('input', () => {
+  clearTimeout(promptSaveTimer);
+  promptSaveTimer = setTimeout(persistDraftMeta, 250);
+});
+$('#singleForm').elements.prompt.addEventListener('change', persistDraftMeta);
+$('#clearDraftButton').addEventListener('click', async () => {
+  clearComposer();
+  try {
+    await clearSavedDraft();
+    toast('已清空上传的视频、图片和提示词');
+  } catch (error) {
+    reportDraftError(error);
+  }
+});
 $('#singleForm').elements.aspect_ratio.addEventListener('change', updateQualityResolution);
 $('#singleForm').elements.quality.addEventListener('change', updateQualityResolution);
 
@@ -567,13 +723,8 @@ $('#singleForm').addEventListener('submit', async (event) => {
     body.append('precision_mode', 'true');
     const data = await api('/api/tasks', { method: 'POST', body });
     form.reset();
-    state.selectedVideos = [];
-    state.selectedImages = [];
-    state.referenceRoles.clear();
-    state.productBoxes.clear();
-    clearMediaPreview($('#videoPreview'));
-    clearMediaPreview($('#imagePreview'));
-    updateQualityResolution();
+    clearComposer();
+    await clearSavedDraft();
     toast(`已加入 ${data.created} 个复刻任务`);
     await loadTasks();
   } catch (error) {
@@ -631,6 +782,11 @@ $('#taskList').addEventListener('click', async (event) => {
 $('#refreshButton').addEventListener('click', () => { loadTasks(); loadHealth(); });
 
 (async function init() {
+  try {
+    await restoreSavedDraft();
+  } catch (error) {
+    reportDraftError(error);
+  }
   updateQualityResolution();
   await Promise.all([loadTasks(true), loadHealth(), loadSystemStatus()]);
   setInterval(() => loadTasks(true), 3000);

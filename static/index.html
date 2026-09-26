@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniMax H3 视频工作台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2378e6c5'/%3E%3Cpath d='M16 18h8v11h16V18h8v28h-8V36H24v10h-8z' fill='%23071018'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=14">
 </head>
 <body>
   <div class="shell">
@@ -54,7 +54,12 @@
 
           <form id="singleForm" class="form tab-content active">
             <div class="file-field required">
-              <label class="file-label" for="uploadVideos">上传视频</label>
+              <div class="file-field-header">
+                <label class="file-label" for="uploadVideos">上传视频</label>
+                <button class="clear-draft-button" id="clearDraftButton" type="button" title="清空上传的视频、图片和提示词" aria-label="清空上传的视频、图片和提示词">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-.7 11H7.7L7 9Zm3 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z"/></svg>
+                </button>
+              </div>
               <input id="uploadVideos" name="upload_videos" type="file" accept="video/*,.mkv" multiple required>
               <p>可多次选择并追加，最多 3 个。AI 默认自动识别要替换的商品；识别不准时可在视频预览下方手动修正区域。</p>
             </div>
@@ -84,12 +89,15 @@
               <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
             </div>
             <p class="resolution-hint" id="qualityResolution">预计输出尺寸：672×384</p>
-            <section class="generation-settings" aria-labelledby="generationSettingsTitle">
-              <div>
-                <h3 id="generationSettingsTitle">生成参数</h3>
-                <p>默认参数适配 MiniMax-H3。修改后会保存到任务，并显示在任务列表中。</p>
-              </div>
-              <div class="four-col">
+            <details class="generation-settings">
+              <summary>
+                <span>
+                  <strong id="generationSettingsTitle">生成参数</strong>
+                  <small>默认参数适配 MiniMax-H3</small>
+                </span>
+                <span class="settings-toggle"><span class="settings-open-label">展开</span><span class="settings-close-label">收起</span></span>
+              </summary>
+              <div class="four-col generation-settings-fields">
                 <label>Scheduler
                   <select name="scheduler">
                     <option value="simple" selected>simple（默认）</option>
@@ -116,7 +124,7 @@
                   <input name="denoise" type="number" min="0.01" max="1" step="0.01" value="1.00" required>
                 </label>
               </div>
-            </section>
+            </details>
             <button class="primary" type="submit">批量加入复刻队列</button>
           </form>
 
@@ -170,6 +178,6 @@
   </dialog>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/app.js?v=13" defer></script>
+  <script src="/app.js?v=14" defer></script>
 </body>
 </html>

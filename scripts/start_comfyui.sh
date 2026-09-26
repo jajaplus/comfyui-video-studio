@@ -10,6 +10,11 @@ if [[ -f .env ]]; then
   set +a
 fi
 
+if [[ -n "${OMP_NUM_THREADS:-}" && ! "$OMP_NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "忽略无效的 OMP_NUM_THREADS=$OMP_NUM_THREADS"
+  unset OMP_NUM_THREADS
+fi
+
 COMFY_DIR="${H3_COMFYUI_DIR:-/root/ComfyUI}"
 if [[ ! -f "$COMFY_DIR/main.py" ]]; then
   echo "找不到 $COMFY_DIR/main.py。请按 README 第 2 节选择一种 ComfyUI 准备方式，并检查 .env 中的 H3_COMFYUI_DIR。" >&2

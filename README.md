@@ -387,6 +387,42 @@ scripts/stop_all.sh
 scripts/start_all.sh
 ```
 
+如果日志中的启动文件是 `/root/autodl-tmp/ComfyUI/main.py`，但当前镜像已经自带 `/root/ComfyUI/main.py`，说明数据盘保留了旧 `.env`。切换到镜像自带版本，并重新挂载四个 H3 模型：
+
+```bash
+cd /root/autodl-tmp/comfyui-video-studio
+scripts/stop_all.sh
+test -f /root/ComfyUI/main.py
+
+sed -i \
+  -e '/^H3_COMFYUI_DIR=/d' \
+  -e '/^H3_COMFYUI_INPUT_DIR=/d' \
+  -e '/^H3_COMFYUI_OUTPUT_DIR=/d' \
+  -e '/^H3_COMFYUI_URL=/d' \
+  -e '/^H3_COMFYUI_PYTHON=/d' \
+  .env
+echo 'H3_COMFYUI_DIR=/root/ComfyUI' >> .env
+echo 'H3_COMFYUI_INPUT_DIR=/root/ComfyUI/input' >> .env
+echo 'H3_COMFYUI_OUTPUT_DIR=/root/ComfyUI/output' >> .env
+echo 'H3_COMFYUI_URL=http://127.0.0.1:6008' >> .env
+
+if [ ! -d /root/ComfyUI/models ]; then
+  if [ -e /root/ComfyUI/models ] || [ -L /root/ComfyUI/models ]; then
+    mv /root/ComfyUI/models "/root/ComfyUI/models.backup.$(date +%s)"
+  fi
+  mkdir -p /root/ComfyUI/models
+fi
+
+scripts/link_autodl_models.sh \
+  '/.autodl/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors' \
+  '/.autodl/Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors' \
+  '/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d' \
+  '/.autodl/Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors'
+
+unset OMP_NUM_THREADS
+scripts/start_all.sh
+```
+
 Mac 本地预览只启动客户端，没有运行 MiniMax-H3 ComfyUI，因此显示未连接是正常现象。实际生成视频时应打开 AutoDL 的 6006 地址。
 
 ### 提示找不到 `comfyui-workflow-templates` 指定版本
