@@ -2,7 +2,7 @@
 
 这是一个部署在 AutoDL 上的视频精准替换客户端。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序执行 MiniMax-H3、SAM2 与 FaceFusion。网页不设置登录或访问令牌，打开地址即可使用。
 
-优先使用已经包含 `/root/ComfyUI` 的 AutoDL 应用镜像，项目会直接复用它。服务器没有 ComfyUI 时，也可以按第 2.2 节安装到 `/root/autodl-tmp/ComfyUI`；两种方式只选择一种。
+优先使用已经包含 `/root/ComfyUI` 的 AutoDL 应用镜像，项目会直接复用它且不主动更新。服务器没有 ComfyUI，或者镜像自带版本缺少 H3 节点但又不希望修改原目录时，可以按第 2.2 节另装一份到 `/root/autodl-tmp/ComfyUI`；两种方式只选择一种。
 
 ## 功能
 
@@ -238,35 +238,26 @@ scripts/install_client_only.sh
 grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
   'MiniMaxH3ReferenceToVideo' \
   /root/ComfyUI/comfy /root/ComfyUI/comfy_extras \
-  && echo 'MiniMax-H3 节点正常' \
-  || echo '需要更新 ComfyUI'
+  && echo 'MiniMax-H3 节点正常：保持原版本，继续第 3 节' \
+  || echo '缺少 H3 节点：不要修改 /root/ComfyUI，改用第 2.2 节'
 ```
 
-如果显示“需要更新 ComfyUI”，下面的命令只更新镜像已有的 ComfyUI 代码和依赖，不会再安装一份：
+检测正常就直接跳到第 3 节，不要执行 `git pull`。如果缺少 H3 节点，执行第 2.2 节，在数据盘安装独立的 ComfyUI，原来的 `/root/ComfyUI` 保持不变。
+
+### 2.2 没有 ComfyUI，或不修改镜像自带版本
+
+本节把独立的 ComfyUI 安装到 `/root/autodl-tmp/ComfyUI`。服务器完全没有 ComfyUI 时，需要使用带 CUDA 版 PyTorch 2.7 或更高版本的基础镜像；服务器已有 `/root/ComfyUI` 时，脚本会优先复用它的 Python 环境，但不会修改它的代码和文件。可以先用无 GPU 模式安装依赖，完成后再切换到 GPU 模式。
+
+先选择可用的 PyTorch 环境并确认它是 CUDA 构建：
 
 ```bash
-cd /root/ComfyUI
-git pull --ff-only
-
 if [ -x /root/miniconda3/envs/comfyui/bin/python ]; then
-  COMFY_PYTHON=/root/miniconda3/envs/comfyui/bin/python
+  BASE_PYTHON=/root/miniconda3/envs/comfyui/bin/python
 else
-  COMFY_PYTHON=python3
+  BASE_PYTHON=python3
 fi
 
-"$COMFY_PYTHON" -m pip install -r requirements.txt
-```
-
-完成后跳到第 3 节。
-
-### 2.2 镜像没有 ComfyUI
-
-这种情况需要使用带 CUDA 版 PyTorch 2.7 或更高版本的 AutoDL 基础镜像。可以先用无 GPU 模式安装依赖，安装完成后再切换到 GPU 模式。
-
-先确认基础镜像中的 PyTorch 是 CUDA 构建：
-
-```bash
-python3 -c "import torch; print('PyTorch:', torch.__version__, 'CUDA构建:', torch.version.cuda, '当前GPU可用:', torch.cuda.is_available())"
+"$BASE_PYTHON" -c "import torch; print('PyTorch:', torch.__version__, 'CUDA构建:', torch.version.cuda, '当前GPU可用:', torch.cuda.is_available())"
 ```
 
 无 GPU 模式下 `当前GPU可用` 显示 `False` 是正常的；`CUDA构建` 必须显示具体版本，不能是 `None`。然后执行：
@@ -275,6 +266,12 @@ python3 -c "import torch; print('PyTorch:', torch.__version__, 'CUDA构建:', to
 cd /root/autodl-tmp/comfyui-video-studio
 cp -n .env.example .env
 
+if [ -x /root/miniconda3/envs/comfyui/bin/python ]; then
+  BASE_PYTHON=/root/miniconda3/envs/comfyui/bin/python
+else
+  BASE_PYTHON=python3
+fi
+
 sed -i \
   -e 's#^H3_COMFYUI_DIR=.*#H3_COMFYUI_DIR=/root/autodl-tmp/ComfyUI#' \
   -e 's#^H3_COMFYUI_INPUT_DIR=.*#H3_COMFYUI_INPUT_DIR=/root/autodl-tmp/ComfyUI/input#' \
@@ -282,10 +279,13 @@ sed -i \
   -e 's#^H3_COMFYUI_URL=.*#H3_COMFYUI_URL=http://127.0.0.1:6008#' \
   .env
 
+sed -i '/^H3_BASE_PYTHON=/d' .env
+echo "H3_BASE_PYTHON=$BASE_PYTHON" >> .env
+
 scripts/install_autodl.sh
 ```
 
-该脚本安装工作台客户端，并把 ComfyUI 安装到 `/root/autodl-tmp/ComfyUI`。它会复用基础镜像已有的 PyTorch 和 CUDA，不会再下载一套 PyTorch。安装结束后继续执行第 3 节。
+该脚本安装工作台客户端，并把独立的 ComfyUI 安装到 `/root/autodl-tmp/ComfyUI`。它会复用选定 Python 环境中的 PyTorch 和 CUDA，不会再下载一套 PyTorch，也不会修改 `/root/ComfyUI`。安装结束后继续执行第 3 节。
 
 ## 3. 一次性加载 AutoDL 模型广场文件
 
@@ -474,33 +474,27 @@ scripts/start_all.sh
 
 Mac 本地预览只启动客户端，没有运行 MiniMax-H3 ComfyUI，因此显示未连接是正常现象。实际生成视频时应打开 AutoDL 的 6006 地址。
 
-### 提示找不到 MiniMaxH3ReferenceToVideo
+### 提示找不到 `comfyui-workflow-templates` 指定版本
 
-下面的命令会从 `.env` 读取当前实际使用的 ComfyUI 目录，因此两种安装方式都适用：
+例如 `requirements.txt` 要求 `comfyui-workflow-templates==0.11.70`，但错误列表最高只有 `0.11.68`，说明 AutoDL 当前 pip 镜像尚未同步新版本。不要修改 ComfyUI 的 `requirements.txt`，直接从官方 PyPI 继续安装：
 
 ```bash
-cd /root/autodl-tmp/comfyui-video-studio
-set -a
-source .env
-set +a
+cd /root/ComfyUI
 
-cd "$H3_COMFYUI_DIR"
-git pull --ff-only
-
-if [ -x .venv/bin/python ]; then
-  COMFY_PYTHON=.venv/bin/python
-elif [ -x venv/bin/python ]; then
-  COMFY_PYTHON=venv/bin/python
-elif [ -x /root/miniconda3/envs/comfyui/bin/python ]; then
+if [ -x /root/miniconda3/envs/comfyui/bin/python ]; then
   COMFY_PYTHON=/root/miniconda3/envs/comfyui/bin/python
+elif [ -x .venv/bin/python ]; then
+  COMFY_PYTHON=.venv/bin/python
 else
   COMFY_PYTHON=python3
 fi
 
-"$COMFY_PYTHON" -m pip install -r requirements.txt
+"$COMFY_PYTHON" -m pip install \
+  --index-url https://pypi.org/simple \
+  -r requirements.txt
 ```
 
-更新后重启服务。
+安装成功后回到项目目录，继续执行第 3 节；不需要重新运行 `git pull`。
 
 ### 提示 SAM2 或 FaceFusion 未安装
 

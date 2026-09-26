@@ -13,6 +13,7 @@ fi
 COMFY_DIR="${H3_COMFYUI_DIR:-/root/autodl-tmp/ComfyUI}"
 BASE_PYTHON="${H3_BASE_PYTHON:-python3}"
 export UV_CACHE_DIR="${H3_UV_CACHE_DIR:-/root/autodl-tmp/.cache/uv}"
+PYPI_INDEX_URL="${H3_PYPI_INDEX_URL:-https://pypi.org/simple}"
 mkdir -p "$UV_CACHE_DIR"
 
 if ! command -v git >/dev/null 2>&1; then
@@ -100,6 +101,7 @@ PY
 echo "正在快速安装 ComfyUI 依赖；复用基础镜像的 torch/torchvision，不重复下载 CUDA 大包。"
 "$COMFY_DIR/.venv/bin/uv" pip install \
   --python "$COMFY_PYTHON" \
+  --index-url "$PYPI_INDEX_URL" \
   -r "$FAST_REQUIREMENTS"
 
 "$COMFY_PYTHON" - <<'PY'
@@ -116,7 +118,7 @@ PY
 
 if ! grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
   "MiniMaxH3ReferenceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
-  echo "当前 ComfyUI 中未找到 MiniMax-H3 原生节点。请更新 ComfyUI 后重新运行本脚本。" >&2
+  echo "安装到 $COMFY_DIR 的独立 ComfyUI 中未找到 MiniMax-H3 原生节点，请检查源码是否完整后重新运行本脚本。" >&2
   exit 1
 fi
 

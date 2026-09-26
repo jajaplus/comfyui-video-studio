@@ -76,7 +76,9 @@ if [ ! -x "$FACEFUSION_ENV/bin/python" ]; then
 fi
 (
   cd "$FACEFUSION_DIR"
-  "$FACEFUSION_ENV/bin/python" install.py cuda@12
+  "$CONDA_BIN" run --no-capture-output \
+    -p "$FACEFUSION_ENV" \
+    python install.py cuda@12
 )
 
 PREFETCH_ARGUMENTS=(
