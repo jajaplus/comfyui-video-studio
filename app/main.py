@@ -61,6 +61,10 @@ SAM2_CHECKPOINT = Path(
     )
 ).resolve()
 SAM2_CONFIG = os.getenv("H3_SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml")
+FLORENCE2_MODEL = os.getenv(
+    "H3_FLORENCE2_MODEL",
+    str(PRECISION_TOOLS_DIR / "models" / "Florence-2-base-ft"),
+)
 FACEFUSION_DIR = Path(
     os.getenv("H3_FACEFUSION_DIR", PRECISION_TOOLS_DIR / "facefusion")
 ).resolve()
@@ -333,8 +337,6 @@ def insert_task(
         x1, y1, x2, y2 = product_box
         if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
             raise ValueError("商品框必须使用 0–1 的归一化坐标")
-    if precision_mode and "product" in roles and product_box is None:
-        raise ValueError("使用商品参考图时，必须在视频首帧框选原商品")
     for image in reference_images:
         image_text = str(image)
         if is_http_url(image_text):
@@ -883,7 +885,8 @@ def unload_comfy_models() -> None:
 
 
 def run_product_mask_composite(
-    source: Path, candidate: Path, product_box: list[float], destination: Path,
+    source: Path, candidate: Path, product_box: list[float] | None,
+    product_reference: Path, target_description: str, destination: Path,
     work_folder: Path,
 ) -> None:
     if not SAM2_PYTHON.is_file() or not SAM2_SCRIPT.is_file():
@@ -894,10 +897,14 @@ def run_product_mask_composite(
             "--source", str(source),
             "--candidate", str(candidate),
             "--output", str(destination),
-            "--box", json.dumps(product_box),
+            "--product-reference", str(product_reference),
+            "--target-description", target_description,
+            "--florence-model", FLORENCE2_MODEL,
             "--model-id", SAM2_MODEL_ID,
             "--work-dir", str(work_folder / "sam2"),
         ]
+    if product_box is not None:
+        command.extend(["--box", json.dumps(product_box)])
     if SAM2_CHECKPOINT.is_file():
         command.extend(["--checkpoint", str(SAM2_CHECKPOINT), "--model-config", SAM2_CONFIG])
     run_external_command(
@@ -1216,8 +1223,10 @@ def process_task(row: sqlite3.Row) -> None:
             working_video = local_source
             if product_sources:
                 product_box = parse_product_box(row)
-                if product_box is None:
-                    raise RuntimeError("缺少原商品框，请重新创建任务并在视频首帧框选商品")
+                mark_task(task_id, stage="准备商品参考图", progress=7)
+                product_references = materialize_reference_images(
+                    product_sources, work_folder, "product_reference"
+                )
                 if len(durations) > 1:
                     mark_task(task_id, stage=f"正在切割源视频（共 {len(durations)} 段）", progress=7)
                     source_parts: list[str | Path] = split_source_video(
@@ -1230,6 +1239,21 @@ def process_task(row: sqlite3.Row) -> None:
                 product_row["reference_images"] = json.dumps(product_sources, ensure_ascii=False)
                 product_row["reference_roles"] = json.dumps(
                     ["product"] * len(product_sources), ensure_ascii=False
+                )
+                original_roles = row_reference_roles(row)
+                product_indices = [
+                    index for index, role in enumerate(original_roles, start=1)
+                    if role == "product"
+                ]
+                mapping = "；".join(
+                    f"当前参考图{new_index}对应原任务参考图{original_index}"
+                    for new_index, original_index in enumerate(product_indices, start=1)
+                )
+                original_prompt = str(row["prompt"] or "").strip()
+                product_row["prompt"] = (
+                    "这是商品专用生成步骤，当前提供的所有参考图都只用于商品外观。"
+                    f"{mapping}。只执行原提示词中的商品或服装替换，忽略人物和脸部替换要求。"
+                    f"原提示词：{original_prompt}"
                 )
                 generated_parts: list[Path] = []
                 for index, (source_part, part_duration) in enumerate(
@@ -1254,10 +1278,16 @@ def process_task(row: sqlite3.Row) -> None:
                     stage="合并商品候选片段" if len(generated_parts) > 1 else "准备商品候选视频",
                 )
                 concat_generated_videos(generated_parts, candidate, work_folder)
-                mark_task(task_id, status="running", progress=95, stage="SAM2 跟踪原商品区域")
+                product_stage = (
+                    "SAM2 跟踪修正后的商品区域"
+                    if product_box is not None
+                    else "AI 识别并跟踪商品区域"
+                )
+                mark_task(task_id, status="running", progress=95, stage=product_stage)
                 product_composite = work_folder / "product_composite.mp4"
                 run_product_mask_composite(
-                    local_source, candidate, product_box, product_composite, work_folder
+                    local_source, candidate, product_box, product_references[0],
+                    str(row["prompt"] or ""), product_composite, work_folder,
                 )
                 working_video = product_composite
 
@@ -1625,8 +1655,8 @@ def excel_template() -> StreamingResponse:
     sheet.append([
         "https://your-domain.example/videos/source.mp4",
         "https://your-domain.example/images/person.jpg\nhttps://your-domain.example/images/product.png",
-        "face\nproduct", "0.42,0.46,0.72,0.88",
-        "把框选的原商品替换成商品参考图，并保持手部遮挡自然。", "auto", "low", "",
+        "face\nproduct", "",
+        "将视频中的人物脸部换成参考图1，人物身上的上衣换成参考图2，并保持手部遮挡自然。", "auto", "low", "",
     ])
     header_fill = PatternFill("solid", fgColor="253449")
     for cell in sheet[1]:
@@ -1648,7 +1678,7 @@ def excel_template() -> StreamingResponse:
     )
     sheet["B1"].comment = Comment("可选；用户自行提供人物或商品图片 URL，每行一个，最多 9 个。", "MiniMax H3 Studio")
     sheet["C1"].comment = Comment("有参考图时必填；与图片逐行对应，只能填 face 或 product。", "MiniMax H3 Studio")
-    sheet["D1"].comment = Comment("使用 product 时必填；视频首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "MiniMax H3 Studio")
+    sheet["D1"].comment = Comment("可选；AI 默认根据提示词和商品参考图定位。识别不准时填写首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "MiniMax H3 Studio")
     sheet["G1"].comment = Comment("可选；low、standard 或 high。默认 low，速度最快。", "MiniMax H3 Studio")
     ratio_validation = DataValidation(type="list", formula1='"auto,16:9,9:16,1:1,4:3,3:4,21:9"')
     sheet.add_data_validation(ratio_validation)
@@ -1663,8 +1693,8 @@ def excel_template() -> StreamingResponse:
         ("upload_video_url", "是", "用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。"),
         ("reference_image_urls", "否", "用户自行提供人物和商品参考图片 URL；每行一个，最多 9 个。"),
         ("reference_roles", "有参考图时是", "与 reference_image_urls 逐行对应。脸部图填 face，商品图填 product。"),
-        ("product_box", "有商品图时是", "首帧原商品框，填写 0–1 坐标 x1,y1,x2,y2。例如 0.42,0.46,0.72,0.88。"),
-        ("prompt", "否", "补充商品外观或替换要求，不需要再说明图片类型。"),
+        ("product_box", "否", "AI 默认自动定位。识别不准时填写首帧原商品框的 0–1 坐标 x1,y1,x2,y2，例如 0.42,0.46,0.72,0.88。"),
+        ("prompt", "否", "写清商品目标会提高定位准确率，例如“人物身上的上衣换成参考图2”。"),
         ("aspect_ratio", "否", "默认 auto，跟随上传视频比例；也可指定固定比例。"),
         ("quality", "否", "清晰度：low（低清，默认且最快）、standard（标清）或 high（高清且最慢）。"),
         ("seed", "否", "固定随机种子便于复现；空白时自动生成。"),

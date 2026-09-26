@@ -1,6 +1,6 @@
 # MiniMax H3 视频替换工作台
 
-这是一个部署在 AutoDL 上的视频精准替换客户端。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序执行 MiniMax-H3、SAM2 与 FaceFusion。网页不设置登录或访问令牌，打开地址即可使用。
+这是一个部署在 AutoDL 上的视频精准替换客户端。浏览器负责上传视频、参考图片和 Excel，FastAPI 保存任务并按顺序执行 MiniMax-H3、Florence-2、SAM2 与 FaceFusion。网页不设置登录或访问令牌，打开地址即可使用。
 
 优先使用已经包含 `/root/ComfyUI` 的 AutoDL 应用镜像，项目会直接复用它且不主动更新。服务器没有 ComfyUI，或者镜像自带版本缺少 H3 节点但又不希望修改原目录时，可以按第 2.2 节另装一份到 `/root/autodl-tmp/ComfyUI`；两种方式只选择一种。
 
@@ -9,8 +9,8 @@
 - 视频和参考图片可多次选择、累计上传、预览和逐项删除。
 - 一次最多选择 3 个视频，每个视频建立一个独立队列任务。
 - 每个任务使用 1 个上传视频和最多 9 张参考图，每张图明确选择“脸部”或“商品”。
-- 使用商品参考图时，在每个视频首帧拖框选择原商品。
-- 商品替换由 MiniMax-H3 生成候选画面，SAM2 跟踪原商品蒙版，并只把候选画面的商品区域合成回原视频。
+- 使用商品参考图时，Florence-2 根据提示词和参考图自动识别视频中的原商品；首帧手动框选仅作为识别不准时的可选修正。
+- 商品替换由 MiniMax-H3 生成候选画面，SAM2 跟踪自动识别或手动修正的商品蒙版，并只把候选画面的商品区域合成回原视频。
 - 脸部替换在商品合成后由 FaceFusion 完成，并组合方框、遮挡和面部区域蒙版；人物的身体、服装、动作与背景继续使用原视频像素。
 - 最终成片恢复上传视频的原声音轨。
 - 视频时长自动读取并显示，视频不能短于 4 秒。
@@ -29,20 +29,21 @@
 ```text
 上传的原视频
   → MiniMax-H3 生成商品候选画面（仅有商品参考图时）
-  → SAM2 从用户框选区域跟踪原商品并局部合成
+  → Florence-2 根据提示词和商品参考图识别首帧原商品
+  → SAM2 跟踪商品区域并局部合成
   → FaceFusion 替换脸部（仅有脸部参考图时）
   → 恢复原视频声音
   → 输出成片
 ```
 
-这条链路避免让 H3 直接重画整个人物。商品区域之外始终来自原视频；换脸也在最后单独执行。SAM2 仍可能在强遮挡、商品完全离开画面、严重运动模糊或镜头切换时跟踪错误，因此商品框要尽量准确，正式生成前建议先用短视频测试。
+这条链路避免让 H3 直接重画整个人物。商品区域之外始终来自原视频；换脸也在最后单独执行。自动识别或 SAM2 跟踪仍可能在目标描述不清、强遮挡、商品完全离开画面、严重运动模糊或镜头切换时出错。遇到识别不准时，可点击视频预览下方的“修正商品区域”手动框选，正式生成前建议先用短视频测试。
 
 为了提高局部替换成功率：
 
 1. 脸部参考图尽量使用清晰、无遮挡、接近正面的单人照片，不要把参考图的服装、姿势或背景作为替换目标。
 2. 商品参考图尽量完整、清晰、背景简单；原视频中必须已经存在需要替换的商品。
-3. 在每张参考图下方选择正确类型；提示词只需补充商品外观或合成要求。
-4. 商品框完整覆盖原商品并略留边缘，不要包含模特的脸或大面积身体。
+3. 在每张参考图下方选择正确类型；提示词写清原视频中的目标，例如“人物身上的上衣换成参考图2”。
+4. 默认不需要框选。自动识别不准时，再用“修正商品区域”完整框住原商品并略留边缘。
 5. 低清适合测试速度；正式商品生成建议选择 `standard` 或 `high`。FaceFusion 的换脸质量不受 H3 清晰度选项影响。
 
 长视频的每个片段由模型独立生成，因此片段连接处可能出现轻微的画面、人物细节或声音跳变。任务列表会显示总片段数、当前片段和整体进度；任意片段失败时可直接重试整个任务。
@@ -68,6 +69,7 @@
 | H3 视频 VAE | `minimax_h3_video_vae_int8_convrot.safetensors` | 2.81 GB |
 | H3 音频 VAE | `minimax_h3_audio_vae_fp32.safetensors` | 605 MB |
 | 商品蒙版跟踪 | `sam2.1_hiera_small.pt` | 184 MB |
+| 商品首帧识别 | `Florence-2-base-ft/model.safetensors` | 463 MB |
 | FaceFusion 换脸 | `inswapper_128_fp16.onnx` | 264.8 MiB |
 | FaceFusion 人脸检测 | `yoloface_8n.onnx` | 12.1 MiB |
 | FaceFusion 关键点 | `2dfan4.onnx`、`fan_68_5.onnx` | 94.3 MiB |
@@ -75,7 +77,9 @@
 | FaceFusion 遮挡与区域蒙版 | `xseg_1.onnx`、`bisenet_resnet_34.onnx` | 156.4 MiB |
 | FaceFusion 公共检查模型 | `nsfw_1/2/3.onnx`、`fairface.onnx`、`kim_vocal_2.onnx` | 584.6 MiB |
 
-H3 四个文件合计约 40.1 GB；SAM2 约 184 MB；本项目指定的 FaceFusion 必需模型合计约 1.25 GiB。PyTorch、CUDA 和 ONNX Runtime 属于运行环境，不在上表的模型大小内。已确认的 AutoDL 模型广场路径和全部加载命令统一放在第 3 节。
+H3 四个文件合计约 40.1 GB；SAM2 约 184 MB；Florence-2 权重约 463 MB；本项目指定的 FaceFusion 必需模型合计约 1.25 GiB。PyTorch、CUDA 和 ONNX Runtime 属于运行环境，不在上表的模型大小内。已确认的 AutoDL 模型广场路径和全部加载命令统一放在第 3 节。
+
+商品自动定位使用微软发布的 [`microsoft/Florence-2-base-ft`](https://huggingface.co/microsoft/Florence-2-base-ft)。安装脚本只下载 safetensors 权重及运行所需的配置、处理器和分词器文件，不会同时下载重复的 `pytorch_model.bin`。
 
 ## 部署结构（先看）
 
@@ -85,15 +89,15 @@ H3 四个文件合计约 40.1 GB；SAM2 约 184 MB；本项目指定的 FaceFusi
 | --- | --- | --- | --- | --- |
 | ComfyUI | 镜像已有则复用；没有则安装 | `/root/ComfyUI` 或 `/root/autodl-tmp/ComfyUI` | `6008` | 加载 MiniMax-H3，并执行商品候选视频生成 |
 | 视频替换工作台 | 本项目需要安装 | `/root/autodl-tmp/comfyui-video-studio` | `6006` | 提供网页、任务队列、Excel 导入和调用流程 |
-| 精准替换工具 | 本项目需要安装 | `/root/autodl-tmp/h3-precision-tools` | 无独立端口 | 使用 SAM2 跟踪商品蒙版，使用 FaceFusion 换脸 |
+| 精准替换工具 | 本项目需要安装 | `/root/autodl-tmp/h3-precision-tools` | 无独立端口 | 使用 Florence-2 定位商品、SAM2 跟踪蒙版、FaceFusion 换脸 |
 
-镜像已有 ComfyUI 时，`scripts/install_client_only.sh` 只安装视频工作台。没有 ComfyUI 时，`scripts/install_autodl.sh` 才会把它安装到数据盘。`scripts/install_precision_tools.sh` 只安装 SAM2 与 FaceFusion。启动时，`scripts/start_all.sh` 根据 `.env` 找到所选的 ComfyUI，同时启动工作台网页。
+镜像已有 ComfyUI 时，`scripts/install_client_only.sh` 只安装视频工作台。没有 ComfyUI 时，`scripts/install_autodl.sh` 才会把它安装到数据盘。`scripts/install_precision_tools.sh` 安装 Florence-2、SAM2 与 FaceFusion。启动时，`scripts/start_all.sh` 根据 `.env` 找到所选的 ComfyUI，同时启动工作台网页。
 
 ```text
 浏览器
   → 6006：视频替换工作台和任务队列
       → 6008：ComfyUI + MiniMax-H3
-      → SAM2：商品区域跟踪与局部合成
+      → Florence-2 + SAM2：商品定位、跟踪与局部合成
       → FaceFusion：脸部替换
 ```
 
@@ -289,7 +293,7 @@ scripts/install_autodl.sh
 
 ## 3. 一次性加载 AutoDL 模型广场文件
 
-无论第 2 节选择哪一种方式，本节命令都会读取 `.env` 中的 `H3_COMFYUI_DIR`，把四个 MiniMax-H3 公共权重挂载到对应的 ComfyUI `models` 目录，并让工作台直接读取 SAM2 公共权重。当前已确认的路径如下：
+无论第 2 节选择哪一种方式，本节命令都会读取 `.env` 中的 `H3_COMFYUI_DIR`，把四个 MiniMax-H3 公共权重挂载到对应的 ComfyUI `models` 目录，并让工作台直接读取 SAM2 与 Florence-2 公共权重。当前已确认的路径如下：
 
 | 类型 | 模型广场名称 | AutoDL 公共路径 | 加载位置 |
 | --- | --- | --- | --- |
@@ -298,8 +302,9 @@ scripts/install_autodl.sh
 | 视频 VAE | `minimax_h3_video_vae_int8_convrot` | `/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d` | `models/vae` |
 | 音频 VAE | `minimax_h3_audio_vae_fp32` | `/.autodl/Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors` | `models/vae` |
 | 商品蒙版跟踪 | `sam2.1_hiera_small.pt` | `/.autodl/51/71/3b/51713b3d1994696d27f35f9c6de6f5ef` | `.env` 直接读取 |
+| 商品首帧识别 | `Florence-2-base-ft` | `/.autodl/53/68/2a/53682a80f2a8321a6133a95084a4f86d` | 安装脚本挂载到精准工具目录 |
 
-公共目录只能读取。下面这一整块命令按顺序完成路径检查、把四个 H3 权重软链接到第 2 节准备好的 ComfyUI、写入 SAM2 公共路径，并安装 SAM2 与 FaceFusion。它不会再次安装 ComfyUI。直接完整复制到 AutoDL 终端执行：
+公共目录只能读取。下面这一整块命令按顺序完成路径检查、把四个 H3 权重软链接到第 2 节准备好的 ComfyUI、写入 SAM2 公共路径，并安装 Florence-2、SAM2 与 FaceFusion。它不会再次安装 ComfyUI。直接完整复制到 AutoDL 终端执行：
 
 ```bash
 (
@@ -311,14 +316,16 @@ H3_TEXT_ENCODER='/.autodl/Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax
 H3_VIDEO_VAE='/.autodl/15/22/fc/1522fc49e094bb75c704ee519582252d'
 H3_AUDIO_VAE='/.autodl/Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors'
 SAM2_MODEL='/.autodl/51/71/3b/51713b3d1994696d27f35f9c6de6f5ef'
+FLORENCE2_MODEL='/.autodl/53/68/2a/53682a80f2a8321a6133a95084a4f86d'
 
-# 1. 检查五个模型广场文件
-ls -lh \
+# 1. 检查六个模型广场路径
+ls -ldh \
   "$H3_DIFFUSION" \
   "$H3_TEXT_ENCODER" \
   "$H3_VIDEO_VAE" \
   "$H3_AUDIO_VAE" \
-  "$SAM2_MODEL"
+  "$SAM2_MODEL" \
+  "$FLORENCE2_MODEL"
 
 # 2. 把四个 MiniMax-H3 权重挂载到 ComfyUI
 scripts/link_autodl_models.sh \
@@ -327,16 +334,18 @@ scripts/link_autodl_models.sh \
   "$H3_VIDEO_VAE" \
   "$H3_AUDIO_VAE"
 
-# 3. 让工作台直接读取 SAM2 公共模型
+# 3. 让工作台复用 SAM2 和 Florence-2 公共模型
 sed -i '/^H3_SAM2_CHECKPOINT=/d' .env
 echo "H3_SAM2_CHECKPOINT=$SAM2_MODEL" >> .env
+sed -i '/^H3_FLORENCE2_PUBLIC_PATH=/d' .env
+echo "H3_FLORENCE2_PUBLIC_PATH=$FLORENCE2_MODEL" >> .env
 
-# 4. 安装 SAM2、FaceFusion 运行环境和缺少的 FaceFusion 模型
+# 4. 安装 Florence-2、SAM2、FaceFusion 运行环境及缺少的模型
 scripts/install_precision_tools.sh
 )
 ```
 
-这组命令在独立子进程中执行；任意路径不存在或某一步失败时会立即停止，但不会退出当前 SSH 终端。四个 H3 权重会以软链接加载到 ComfyUI；SAM2 直接读取公共文件，均不会复制到自己的数据盘。
+这组命令在独立子进程中执行；任意路径不存在或某一步失败时会立即停止，但不会退出当前 SSH 终端。四个 H3 权重会以软链接加载到 ComfyUI，SAM2 直接读取公共文件。Florence-2 公共路径如果是完整模型目录，安装脚本会挂载其中的文件；如果是单个 safetensors 权重文件，脚本会挂载权重，并只下载体积很小的配置、处理器和分词器文件。463 MB 的 Florence-2 权重不会再重复下载。
 
 FaceFusion 的模型广场路径尚未提供，因此最后一步会下载项目需要的约 1.25 GiB ONNX 文件。如果以后找到了包含这些 ONNX 文件的公共目录，可以先把 `H3_FACEFUSION_MODELS_DIR=/.autodl/公共模型实际目录` 写入 `.env`，安装脚本就会优先复用。不要手工运行 FaceFusion 的 `force-download`，否则会下载当前版本提供的全部模型。
 
@@ -496,9 +505,9 @@ fi
 
 安装成功后回到项目目录，继续执行第 3 节；不需要重新运行 `git pull`。
 
-### 提示 SAM2 或 FaceFusion 未安装
+### 提示 Florence-2、SAM2 或 FaceFusion 未安装
 
-这是精准模式需要的两个独立工具。在 AutoDL 终端执行：
+这是精准模式需要的三个独立工具。在 AutoDL 终端执行：
 
 ```bash
 cd /root/autodl-tmp/comfyui-video-studio
@@ -511,10 +520,11 @@ scripts/start_all.sh
 
 ```bash
 /root/autodl-tmp/h3-precision-tools/sam2-env/bin/python -c "import sam2; print('SAM2 正常')"
+/root/autodl-tmp/h3-precision-tools/sam2-env/bin/python -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('/root/autodl-tmp/h3-precision-tools/models/Florence-2-base-ft', trust_remote_code=True, local_files_only=True); print('Florence-2 正常')"
 /root/autodl-tmp/h3-precision-tools/facefusion-env/bin/python /root/autodl-tmp/h3-precision-tools/facefusion/facefusion.py --version
 ```
 
-首次安装会下载约 184 MB 的 SAM2.1 Small 和约 1.25 GiB 的 FaceFusion 必需模型；配置 AutoDL 公共模型路径后会直接复用。生成时系统会在 H3 完成后释放 ComfyUI 模型，再启动 SAM2 和 FaceFusion，降低同时占用显存的概率。
+没有配置公共路径时，首次安装会下载约 463 MB 的 Florence-2、约 184 MB 的 SAM2.1 Small 和约 1.25 GiB 的 FaceFusion 必需模型；按第 3 节配置后会直接复用 Florence-2 和 SAM2 公共权重。生成时系统会在 H3 完成后释放 ComfyUI 模型，再启动 Florence-2、SAM2 和 FaceFusion，降低同时占用显存的概率。
 
 ### 查看 GPU 使用情况
 
@@ -568,15 +578,15 @@ open http://127.0.0.1:6006
 | `upload_video_url` | 是 | 用户自行提供的公开视频 URL；不能短于 4 秒，超过 15 秒会自动分段生成并合并 |
 | `reference_image_urls` | 否 | 用户自行提供的参考图片 URL，每行一个，最多 9 个 |
 | `reference_roles` | 有参考图时是 | 与图片 URL 逐行对应；脸部图填 `face`，商品图填 `product` |
-| `product_box` | 有商品图时是 | 首帧原商品框的归一化坐标 `x1,y1,x2,y2`，四个数都在 0–1 之间 |
-| `prompt` | 否 | 商品外观或局部合成的补充要求 |
+| `product_box` | 否 | AI 默认自动定位；识别不准时可填写首帧原商品框的归一化坐标 `x1,y1,x2,y2` |
+| `prompt` | 否 | 商品外观或局部合成要求；写清“人物身上的上衣”等目标可提高自动定位准确率 |
 | `aspect_ratio` | 否 | `auto`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 或 `21:9` |
 | `quality` | 否 | `low`、`standard` 或 `high`，默认 `low` |
 | `seed` | 否 | 随机种子，留空时自动生成 |
 
 URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接访问。临时过期、需要登录或禁止外链的 URL 无法使用。
 
-`product_box` 示例为 `0.42,0.46,0.72,0.88`，表示商品框左上角在画面的 42%/46%，右下角在 72%/88%。网页上传可以直接拖框，不需要手工计算坐标；只有 Excel 导入需要填写。
+`product_box` 可以留空。系统会先从提示词判断上衣、包、鞋等目标；提示词没有写明时，再从商品参考图判断，并自动定位视频首帧中的原商品。识别不准时才填写该列，例如 `0.42,0.46,0.72,0.88` 表示左上角在画面的 42%/46%，右下角在 72%/88%。网页上传可点击视频预览下方的“修正商品区域”拖框。
 
 ## 9. 目录与端口
 
@@ -588,7 +598,7 @@ URL 必须以 `http://` 或 `https://` 开头，并允许 AutoDL 服务器直接
 - 镜像自带的 ComfyUI：`/root/ComfyUI`
 - 第 2.2 节自行安装的 ComfyUI：`/root/autodl-tmp/ComfyUI`
 - 安装下载缓存：`/root/autodl-tmp/.cache/uv`
-- SAM2 与 FaceFusion：`/root/autodl-tmp/h3-precision-tools`
+- Florence-2、SAM2 与 FaceFusion：`/root/autodl-tmp/h3-precision-tools`
 - 队列数据库：`$H3_STUDIO_DATA_DIR/studio.db`
 - 生成结果：`$H3_STUDIO_DATA_DIR/outputs`
 - ComfyUI 工作流：`workflows/minimax_h3_ref2va_api.json`

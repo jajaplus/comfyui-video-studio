@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Track a boxed product in the source video and composite only that area from a candidate."""
+"""Automatically locate or manually box a product, track it, and composite that region."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from fractions import Fraction
@@ -15,6 +16,29 @@ import numpy as np
 import torch
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 from sam2.build_sam import build_sam2_video_predictor
+
+
+PRODUCT_HINTS = (
+    (r"(?:t恤|tee\s*shirt|t-?shirt)", "t-shirt"),
+    (r"(?:衬衫|shirt|blouse)", "shirt"),
+    (r"(?:上衣|衣服|服装|衣物|top|clothing|garment)", "upper-body clothing"),
+    (r"(?:外套|夹克|大衣|jacket|coat)", "jacket"),
+    (r"(?:连衣裙|裙子|dress|skirt)", "dress"),
+    (r"(?:裤子|长裤|短裤|pants|trousers|shorts)", "pants"),
+    (r"(?:鞋子|鞋|运动鞋|靴子|shoes|sneakers|boots)", "shoes"),
+    (r"(?:手提包|背包|包包|包|handbag|backpack|bag)", "bag"),
+    (r"(?:帽子|帽|hat|cap)", "hat"),
+    (r"(?:眼镜|墨镜|glasses|sunglasses)", "glasses"),
+    (r"(?:手表|腕表|watch)", "watch"),
+    (r"(?:项链|necklace)", "necklace"),
+    (r"(?:耳环|耳饰|earrings?)", "earrings"),
+    (r"(?:手机|电话|phone|smartphone)", "phone"),
+    (r"(?:杯子|水杯|mug|cup|bottle)", "cup"),
+)
+GENERIC_REFERENCE_LABELS = {
+    "person", "people", "man", "woman", "boy", "girl", "human", "face",
+    "model", "background", "image", "photo", "object",
+}
 
 
 def run(command: list[str], label: str) -> None:
@@ -59,21 +83,180 @@ def load_resized(path: Path, width: int, height: int) -> np.ndarray:
     return frame
 
 
+def target_from_text(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern, target in PRODUCT_HINTS:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return target
+    return None
+
+
+def florence_inference(model, processor, image, task: str, text_input: str = ""):
+    prompt = task + text_input
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    prepared = {}
+    for key, value in inputs.items():
+        if torch.is_floating_point(value):
+            prepared[key] = value.to(model.device, dtype=model.dtype)
+        else:
+            prepared[key] = value.to(model.device)
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            **prepared, max_new_tokens=512, do_sample=False, num_beams=3,
+        )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed = processor.post_process_generation(
+        generated_text, task=task, image_size=(image.width, image.height),
+    )
+    return parsed.get(task, parsed) if isinstance(parsed, dict) else parsed
+
+
+def flatten_points(value) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 2 and all(isinstance(item, (int, float)) for item in value[:2]):
+            points.append((float(value[0]), float(value[1])))
+        else:
+            for item in value:
+                points.extend(flatten_points(item))
+    return points
+
+
+def boxes_and_labels(payload) -> tuple[list[list[float]], list[str]]:
+    if not isinstance(payload, dict):
+        return [], []
+    boxes = [list(map(float, box[:4])) for box in payload.get("bboxes", []) if len(box) >= 4]
+    labels = [str(label).strip() for label in payload.get("labels", [])]
+    if not boxes:
+        for polygon in payload.get("polygons", []):
+            points = flatten_points(polygon)
+            if points:
+                xs = [point[0] for point in points]
+                ys = [point[1] for point in points]
+                boxes.append([min(xs), min(ys), max(xs), max(ys)])
+    if len(labels) < len(boxes):
+        labels.extend([""] * (len(boxes) - len(labels)))
+    return boxes, labels
+
+
+def load_florence(model_source: str, device: str):
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    source_path = Path(model_source)
+    local_only = source_path.exists()
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(
+        model_source, trust_remote_code=True, local_files_only=local_only,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_source, torch_dtype=dtype, trust_remote_code=True,
+        local_files_only=local_only,
+    ).to(device)
+    model.eval()
+    return model, processor
+
+
+def infer_reference_target(model, processor, reference, description: str) -> str:
+    prompt_target = target_from_text(description)
+    if prompt_target:
+        return prompt_target
+    payload = florence_inference(model, processor, reference, "<OD>")
+    boxes, labels = boxes_and_labels(payload)
+    candidates: list[tuple[float, str]] = []
+    for box, label in zip(boxes, labels):
+        normalized = label.lower().strip(" .")
+        if not normalized or normalized in GENERIC_REFERENCE_LABELS:
+            continue
+        area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+        product_bonus = 2.0 if target_from_text(normalized) else 1.0
+        candidates.append((area * product_bonus, target_from_text(normalized) or normalized))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+    caption = florence_inference(model, processor, reference, "<MORE_DETAILED_CAPTION>")
+    caption_text = str(caption)
+    caption_target = target_from_text(caption_text)
+    if caption_target:
+        return caption_target
+    raise RuntimeError("AI 无法判断商品参考图的类型，请在提示词中写明要替换的物品，例如上衣、包或鞋")
+
+
+def choose_box(boxes: list[list[float]], width: int, height: int) -> list[float] | None:
+    valid: list[tuple[float, list[float]]] = []
+    for raw in boxes:
+        x1, y1, x2, y2 = raw
+        x1, x2 = sorted((max(0.0, x1), min(float(width), x2)))
+        y1, y2 = sorted((max(0.0, y1), min(float(height), y2)))
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            continue
+        area_ratio = ((x2 - x1) * (y2 - y1)) / max(1.0, width * height)
+        center_x = (x1 + x2) / (2 * width)
+        center_y = (y1 + y2) / (2 * height)
+        center_distance = ((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) ** 0.5
+        score = area_ratio * max(0.35, 1.0 - center_distance * 0.55)
+        if area_ratio <= 0.82:
+            valid.append((score, [x1, y1, x2, y2]))
+    return max(valid, key=lambda item: item[0])[1] if valid else None
+
+
+def auto_product_box(
+    first_frame: Path, product_reference: Path, description: str,
+    florence_model: str,
+) -> tuple[list[float], str]:
+    from PIL import Image
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, processor = load_florence(florence_model, device)
+    reference = Image.open(product_reference).convert("RGB")
+    source = Image.open(first_frame).convert("RGB")
+    target = infer_reference_target(model, processor, reference, description)
+    payload = florence_inference(
+        model, processor, source, "<OPEN_VOCABULARY_DETECTION>", target,
+    )
+    boxes, _ = boxes_and_labels(payload)
+    selected = choose_box(boxes, source.width, source.height)
+    if selected is None:
+        payload = florence_inference(
+            model, processor, source, "<CAPTION_TO_PHRASE_GROUNDING>", target,
+        )
+        boxes, _ = boxes_and_labels(payload)
+        selected = choose_box(boxes, source.width, source.height)
+    if selected is None:
+        raise RuntimeError(
+            f"AI 没有在视频首帧找到“{target}”，请使用客户端的“修正商品区域”手动框选"
+        )
+    margin_x = max(2.0, (selected[2] - selected[0]) * 0.03)
+    margin_y = max(2.0, (selected[3] - selected[1]) * 0.03)
+    expanded = [
+        max(0.0, selected[0] - margin_x) / source.width,
+        max(0.0, selected[1] - margin_y) / source.height,
+        min(float(source.width), selected[2] + margin_x) / source.width,
+        min(float(source.height), selected[3] + margin_y) / source.height,
+    ]
+    return expanded, target
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--box", required=True)
+    parser.add_argument("--box")
+    parser.add_argument("--product-reference", type=Path)
+    parser.add_argument("--target-description", default="")
+    parser.add_argument("--florence-model", default="microsoft/Florence-2-base-ft")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--model-config", default="configs/sam2.1/sam2.1_hiera_s.yaml")
     parser.add_argument("--work-dir", required=True, type=Path)
     args = parser.parse_args()
 
-    box = [float(value) for value in json.loads(args.box)]
-    if len(box) != 4 or not (0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1):
+    box = [float(value) for value in json.loads(args.box)] if args.box else None
+    if box is not None and (
+        len(box) != 4 or not (0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1)
+    ):
         raise ValueError("商品框必须是 [x1,y1,x2,y2] 的 0–1 坐标")
+    if box is None and (not args.product_reference or not args.product_reference.is_file()):
+        raise ValueError("自动识别商品区域需要商品参考图")
 
     shutil.rmtree(args.work_dir, ignore_errors=True)
     source_dir = args.work_dir / "source"
@@ -93,6 +276,12 @@ def main() -> None:
     if first is None:
         raise RuntimeError("无法读取源视频首帧")
     height, width = first.shape[:2]
+    if box is None:
+        box, target = auto_product_box(
+            source_frames[0], args.product_reference, args.target_description,
+            args.florence_model,
+        )
+        print(json.dumps({"auto_product_box": box, "target": target}, ensure_ascii=False), flush=True)
     pixel_box = np.array(
         [box[0] * width, box[1] * height, box[2] * width, box[3] * height],
         dtype=np.float32,

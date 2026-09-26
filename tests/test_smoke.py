@@ -129,6 +129,7 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(template["任务"]["B1"].value, "reference_image_urls")
         self.assertEqual(template["任务"]["C1"].value, "reference_roles")
         self.assertEqual(template["任务"]["D1"].value, "product_box")
+        self.assertIsNone(template["任务"]["D2"].value)
         self.assertEqual(template["任务"]["G1"].value, "quality")
         self.assertEqual(template["任务"]["G2"].value, "low")
         self.assertGreater(len(template["任务"].data_validations.dataValidation), 0)
@@ -252,7 +253,7 @@ class StudioSmokeTest(unittest.TestCase):
         task_id = self.main.insert_task(
             prompt="只替换商品和脸", source_video=source,
             reference_images=[face, product], reference_roles=["face", "product"],
-            product_box=[0.2, 0.3, 0.6, 0.8], precision_mode=True,
+            product_box=None, precision_mode=True,
             duration=6.0, aspect_ratio="auto", seed=12, display_name="precise.mp4",
         )
         with self.main.connect_db() as conn:
@@ -262,12 +263,18 @@ class StudioSmokeTest(unittest.TestCase):
 
         def fake_segment(_parent, segment_row, _index, _count, destination):
             self.assertEqual(self.main.row_reference_paths(segment_row), [str(product)])
+            self.assertIn("当前参考图1对应原任务参考图2", segment_row["prompt"])
+            self.assertIn("忽略人物和脸部替换要求", segment_row["prompt"])
             destination.write_bytes(b"candidate")
             calls.append("h3")
             return True
 
-        def fake_composite(_source, _candidate, box, destination, _work):
-            self.assertEqual(box, [0.2, 0.3, 0.6, 0.8])
+        def fake_composite(
+            _source, _candidate, box, product_reference, description, destination, _work,
+        ):
+            self.assertIsNone(box)
+            self.assertEqual(product_reference.read_bytes(), b"product")
+            self.assertEqual(description, "只替换商品和脸")
             destination.write_bytes(b"product-composite")
             calls.append("sam2")
 

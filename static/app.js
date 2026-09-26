@@ -228,7 +228,7 @@ function renderMediaPreview(files, container, kind) {
       const selectBox = document.createElement('button');
       selectBox.type = 'button';
       selectBox.className = `media-tool-button${state.productBoxes.has(fileKey(file)) ? ' ready' : ''}`;
-      selectBox.textContent = state.productBoxes.has(fileKey(file)) ? '✓ 已框选商品（可重选）' : '框选原商品';
+      selectBox.textContent = state.productBoxes.has(fileKey(file)) ? '✓ 已修正商品区域（可重选）' : '可选：修正商品区域';
       selectBox.addEventListener('click', () => openProductBoxPicker(file));
       tools.append(selectBox);
     }
@@ -332,7 +332,7 @@ function openProductBoxPicker(file) {
   boxPicker.frame = null;
   boxPicker.rect = null;
   boxPicker.objectUrl = URL.createObjectURL(file);
-  $('#productBoxFile').textContent = `${file.name}：在首帧拖动鼠标，完整框住要替换的商品。`;
+  $('#productBoxFile').textContent = `${file.name}：AI 会自动识别；只有识别不准时，才需要在首帧框住要替换的商品。`;
   dialog.showModal();
   video.muted = true;
   video.preload = 'auto';
@@ -552,11 +552,6 @@ $('#singleForm').addEventListener('submit', async (event) => {
     if (videos.length > 3) throw new Error('上传视频最多选择 3 个');
     if (state.selectedImages.length > 9) throw new Error('参考图片最多上传 9 张');
     const referenceRoles = state.selectedImages.map((file) => state.referenceRoles.get(fileKey(file)) || 'face');
-    const hasProductReference = referenceRoles.includes('product');
-    if (hasProductReference) {
-      const missingBox = videos.find((file) => !state.productBoxes.has(fileKey(file)));
-      if (missingBox) throw new Error(`请先为 ${missingBox.name} 框选原商品`);
-    }
     const durations = await Promise.all(videos.map(readVideoDuration));
     const invalidIndex = durations.findIndex((duration) => duration < 4);
     if (invalidIndex >= 0) {
