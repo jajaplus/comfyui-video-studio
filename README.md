@@ -359,7 +359,34 @@ scripts/install_precision_tools.sh
 
 这组命令在独立子进程中执行；任意路径不存在或某一步失败时会立即停止，但不会退出当前 SSH 终端。四个 H3 权重会以软链接加载到 ComfyUI，SAM2 直接读取公共文件。Florence-2 公共路径如果是完整模型目录，安装脚本会挂载其中的文件；如果是单个 safetensors 权重文件，脚本会挂载权重，并只下载体积很小的配置、处理器和分词器文件。463 MB 的 Florence-2 权重不会再重复下载。
 
+安装脚本会递归查找 Florence-2 公共目录，完整目录可以完全离线复用。如果公共路径只有单个权重，仍需联网补齐配置和分词器；脚本会先显示下载说明，并在默认 60 秒后停止，不会无限卡住。需要使用可访问镜像时，可在 `.env` 设置：
+
+```bash
+H3_HF_ENDPOINT=https://hf-mirror.com
+H3_HF_DOWNLOAD_TIMEOUT=60
+```
+
+`RequestsDependencyWarning` 只是 requests 的版本提示，不是安装失败。出现该提示后长时间没有进度，通常表示服务器正在等待 Hugging Face 连接。
+
 FaceFusion 的模型广场路径尚未提供，因此最后一步会下载项目需要的约 1.25 GiB ONNX 文件。如果以后找到了包含这些 ONNX 文件的公共目录，可以先把 `H3_FACEFUSION_MODELS_DIR=/.autodl/公共模型实际目录` 写入 `.env`，安装脚本就会优先复用。不要手工运行 FaceFusion 的 `force-download`，否则会下载当前版本提供的全部模型。
+
+FaceFusion 模型来自 GitHub Release。下载器会保留 `.part` 临时文件、断点续传、显示 MB 进度，并默认重试 8 次。AutoDL 连接 GitHub 不稳定时，先启用平台内置的学术资源加速，再重新执行安装脚本：
+
+```bash
+source /etc/network_turbo
+cd /root/autodl-tmp/comfyui-video-studio
+scripts/install_precision_tools.sh
+unset http_proxy https_proxy
+```
+
+如果当前地区没有 `/etc/network_turbo`，也可在 `.env` 填写支持“代理前缀 + 原始 GitHub URL”格式的地址，例如：
+
+```bash
+H3_GITHUB_PROXY=https://ghfast.top
+H3_FACEFUSION_DOWNLOAD_RETRIES=8
+```
+
+下载得到的 ONNX 会按照 FaceFusion 提供的 `.hash` 文件执行 SHA-256 校验；已经完整的模型直接跳过。
 
 ## 4. 切换到 GPU 模式并启动
 

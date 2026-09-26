@@ -34,6 +34,8 @@ SAM2_CHECKPOINT="${H3_SAM2_CHECKPOINT:-$TOOLS_DIR/models/sam2.1_hiera_small.pt}"
 FLORENCE2_MODEL="${H3_FLORENCE2_MODEL:-$TOOLS_DIR/models/Florence-2-base-ft}"
 FLORENCE2_MODEL_ID="${H3_FLORENCE2_MODEL_ID:-microsoft/Florence-2-base-ft}"
 FLORENCE2_PUBLIC_PATH="${H3_FLORENCE2_PUBLIC_PATH:-}"
+HF_ENDPOINT_URL="${H3_HF_ENDPOINT:-https://huggingface.co}"
+HF_DOWNLOAD_TIMEOUT="${H3_HF_DOWNLOAD_TIMEOUT:-60}"
 
 mkdir -p "$TOOLS_DIR"
 
@@ -93,9 +95,19 @@ if [[ -n "$FLORENCE2_PUBLIC_PATH" ]]; then
   fi
   mkdir -p "$FLORENCE2_MODEL"
   if [ -d "$FLORENCE2_PUBLIC_PATH" ]; then
-    while IFS= read -r -d '' item; do
-      ln -sfn "$item" "$FLORENCE2_MODEL/$(basename "$item")"
-    done < <(find "$FLORENCE2_PUBLIC_PATH" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0)
+    FLORENCE2_PUBLIC_CONFIG="$(find -L "$FLORENCE2_PUBLIC_PATH" -type f -name config.json -print -quit 2>/dev/null || true)"
+    if [[ -n "$FLORENCE2_PUBLIC_CONFIG" ]]; then
+      FLORENCE2_PUBLIC_DIR="$(dirname "$FLORENCE2_PUBLIC_CONFIG")"
+      while IFS= read -r -d '' item; do
+        ln -sfn "$item" "$FLORENCE2_MODEL/$(basename "$item")"
+      done < <(find -L "$FLORENCE2_PUBLIC_DIR" -mindepth 1 -maxdepth 1 -type f -print0)
+      echo "找到 Florence-2 完整公共目录：$FLORENCE2_PUBLIC_DIR"
+    else
+      FLORENCE2_PUBLIC_WEIGHT="$(find -L "$FLORENCE2_PUBLIC_PATH" -type f -name '*.safetensors' -print -quit 2>/dev/null || true)"
+      if [[ -n "$FLORENCE2_PUBLIC_WEIGHT" ]]; then
+        ln -sfn "$FLORENCE2_PUBLIC_WEIGHT" "$FLORENCE2_MODEL/model.safetensors"
+      fi
+    fi
   else
     ln -sfn "$FLORENCE2_PUBLIC_PATH" "$FLORENCE2_MODEL/model.safetensors"
   fi
@@ -106,9 +118,24 @@ if [ -f "$FLORENCE2_MODEL/config.json" ] && [ -f "$FLORENCE2_MODEL/model.safeten
   echo "复用 Florence-2 商品识别模型：$FLORENCE2_MODEL"
 else
   mkdir -p "$FLORENCE2_MODEL"
-  FLORENCE2_LOCAL_DIR="$FLORENCE2_MODEL" \
-  FLORENCE2_REPO_ID="$FLORENCE2_MODEL_ID" \
-  "$SAM2_ENV/bin/python" -c "import os; from pathlib import Path; from huggingface_hub import snapshot_download; target=Path(os.environ['FLORENCE2_LOCAL_DIR']); patterns=['*.json', '*.txt', '*.py', '*.model']; patterns += [] if (target / 'model.safetensors').is_file() else ['*.safetensors']; snapshot_download(repo_id=os.environ['FLORENCE2_REPO_ID'], local_dir=target, allow_patterns=patterns)"
+  if [ -f "$FLORENCE2_MODEL/model.safetensors" ]; then
+    echo "公共路径只有 Florence-2 权重，开始联网补齐配置、处理器和分词器文件。"
+  else
+    echo "未找到 Florence-2 权重，开始联网下载完整运行文件。"
+  fi
+  echo "下载地址：$HF_ENDPOINT_URL；最长等待：${HF_DOWNLOAD_TIMEOUT} 秒"
+  if ! FLORENCE2_LOCAL_DIR="$FLORENCE2_MODEL" \
+    FLORENCE2_REPO_ID="$FLORENCE2_MODEL_ID" \
+    HF_ENDPOINT="$HF_ENDPOINT_URL" \
+    HF_HUB_ETAG_TIMEOUT=10 \
+    HF_HUB_DOWNLOAD_TIMEOUT=30 \
+    PYTHONWARNINGS=ignore \
+    timeout "$HF_DOWNLOAD_TIMEOUT" \
+    "$SAM2_ENV/bin/python" -c "import os; from pathlib import Path; from huggingface_hub import snapshot_download; target=Path(os.environ['FLORENCE2_LOCAL_DIR']); patterns=['*.json', '*.txt', '*.py', '*.model']; patterns += [] if (target / 'model.safetensors').is_file() else ['*.safetensors']; snapshot_download(repo_id=os.environ['FLORENCE2_REPO_ID'], local_dir=target, allow_patterns=patterns)"; then
+    echo "Florence-2 配套文件下载失败或超时。公共路径只有权重时，仍需要少量配置和分词器文件。" >&2
+    echo "可在 .env 设置可访问的 H3_HF_ENDPOINT 后重试，例如 https://hf-mirror.com。" >&2
+    exit 1
+  fi
 fi
 
 if [ ! -d "$FACEFUSION_DIR/.git" ]; then
