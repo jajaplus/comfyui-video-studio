@@ -50,6 +50,9 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertIn("<Video 1>", prompt)
         self.assertIn("<Picture 1>", prompt)
         self.assertIn("<Picture 2>", prompt)
+        self.assertIn("change only the visible facial identity", prompt)
+        self.assertIn("main model must never disappear", prompt)
+        self.assertIn("replace only the pixels belonging to the original product", prompt)
 
         def fake_http(method, url, payload=None, timeout=60):
             if url.endswith("/prompt"):
@@ -92,11 +95,14 @@ class StudioSmokeTest(unittest.TestCase):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "任务"
-        sheet.append(["upload_video_url", "reference_image_urls", "prompt", "aspect_ratio", "seed"])
+        sheet.append([
+            "upload_video_url", "reference_image_urls", "reference_roles", "product_box",
+            "prompt", "aspect_ratio", "quality", "seed",
+        ])
         sheet.append([
             "https://media.example.com/bulk.mp4",
             "https://media.example.com/face.jpg",
-            "自然光", "9:16", 99,
+            "face", "", "自然光", "9:16", "low", 99,
         ])
         excel_data = io.BytesIO()
         workbook.save(excel_data)
@@ -121,8 +127,10 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(template.sheetnames, ["任务", "字段说明"])
         self.assertEqual(template["任务"]["A1"].value, "upload_video_url")
         self.assertEqual(template["任务"]["B1"].value, "reference_image_urls")
-        self.assertEqual(template["任务"]["E1"].value, "quality")
-        self.assertEqual(template["任务"]["E2"].value, "low")
+        self.assertEqual(template["任务"]["C1"].value, "reference_roles")
+        self.assertEqual(template["任务"]["D1"].value, "product_box")
+        self.assertEqual(template["任务"]["G1"].value, "quality")
+        self.assertEqual(template["任务"]["G2"].value, "low")
         self.assertGreater(len(template["任务"].data_validations.dataValidation), 0)
 
     def test_03_manual_multiple_videos(self) -> None:
@@ -231,6 +239,60 @@ class StudioSmokeTest(unittest.TestCase):
         self.assertEqual(completed["segment_count"], 3)
         self.assertEqual(completed["current_segment"], 3)
         self.assertTrue(Path(completed["output_path"]).is_file())
+
+    def test_08_precision_pipeline_orders_product_face_and_audio(self) -> None:
+        folder = Path(self.temp.name) / "precision"
+        folder.mkdir(exist_ok=True)
+        source = folder / "source.mp4"
+        face = folder / "face.jpg"
+        product = folder / "product.png"
+        source.write_bytes(b"video")
+        face.write_bytes(b"face")
+        product.write_bytes(b"product")
+        task_id = self.main.insert_task(
+            prompt="只替换商品和脸", source_video=source,
+            reference_images=[face, product], reference_roles=["face", "product"],
+            product_box=[0.2, 0.3, 0.6, 0.8], precision_mode=True,
+            duration=6.0, aspect_ratio="auto", seed=12, display_name="precise.mp4",
+        )
+        with self.main.connect_db() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+        calls: list[str] = []
+
+        def fake_segment(_parent, segment_row, _index, _count, destination):
+            self.assertEqual(self.main.row_reference_paths(segment_row), [str(product)])
+            destination.write_bytes(b"candidate")
+            calls.append("h3")
+            return True
+
+        def fake_composite(_source, _candidate, box, destination, _work):
+            self.assertEqual(box, [0.2, 0.3, 0.6, 0.8])
+            destination.write_bytes(b"product-composite")
+            calls.append("sam2")
+
+        def fake_facefusion(refs, _target, destination, _work):
+            self.assertEqual(len(refs), 1)
+            destination.write_bytes(b"face-output")
+            calls.append("facefusion")
+
+        def fake_audio(_processed, _source, destination):
+            destination.write_bytes(b"final")
+            calls.append("audio")
+
+        with patch.object(self.main, "probe_video_dimensions", return_value=(1920, 1080)), patch.object(
+            self.main, "run_comfy_segment", side_effect=fake_segment
+        ), patch.object(self.main, "run_product_mask_composite", side_effect=fake_composite), patch.object(
+            self.main, "run_facefusion", side_effect=fake_facefusion
+        ), patch.object(self.main, "restore_original_audio", side_effect=fake_audio):
+            self.main.process_task(row)
+
+        self.assertEqual(calls, ["h3", "sam2", "facefusion", "audio"])
+        with self.main.connect_db() as conn:
+            completed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["stage"], "精准替换完成")
+        self.assertEqual((completed["output_width"], completed["output_height"]), (1920, 1080))
 
 
 if __name__ == "__main__":

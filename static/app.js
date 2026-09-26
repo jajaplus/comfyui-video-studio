@@ -2,8 +2,11 @@ const state = {
   tasks: [],
   selectedVideos: [],
   selectedImages: [],
+  referenceRoles: new Map(),
+  productBoxes: new Map(),
 };
 const videoMetadataCache = new WeakMap();
+const boxPicker = { file: null, frame: null, rect: null, start: null, objectUrl: null };
 
 const $ = (selector) => document.querySelector(selector);
 const statusLabels = {
@@ -212,6 +215,23 @@ function renderMediaPreview(files, container, kind) {
     const meta = document.createElement('span');
     meta.textContent = isVideo(file) ? '正在读取时长…' : `${(file.size / 1024 / 1024).toFixed(1)} MB`;
     info.append(name, meta);
+    const tools = document.createElement('div');
+    tools.className = 'media-tools';
+    if (kind === 'image') {
+      const role = document.createElement('select');
+      role.setAttribute('aria-label', `${file.name} 的参考类型`);
+      role.innerHTML = '<option value="face">脸部参考图</option><option value="product">商品参考图</option>';
+      role.value = state.referenceRoles.get(fileKey(file)) || 'face';
+      role.addEventListener('change', () => state.referenceRoles.set(fileKey(file), role.value));
+      tools.append(role);
+    } else {
+      const selectBox = document.createElement('button');
+      selectBox.type = 'button';
+      selectBox.className = `media-tool-button${state.productBoxes.has(fileKey(file)) ? ' ready' : ''}`;
+      selectBox.textContent = state.productBoxes.has(fileKey(file)) ? '✓ 已框选商品（可重选）' : '框选原商品';
+      selectBox.addEventListener('click', () => openProductBoxPicker(file));
+      tools.append(selectBox);
+    }
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'media-remove';
@@ -222,11 +242,13 @@ function renderMediaPreview(files, container, kind) {
       const stateKey = kind === 'video' ? 'selectedVideos' : 'selectedImages';
       const input = kind === 'video' ? $('#uploadVideos') : $('#referenceImages');
       state[stateKey] = state[stateKey].filter((item) => fileKey(item) !== fileKey(file));
+      if (kind === 'video') state.productBoxes.delete(fileKey(file));
+      else state.referenceRoles.delete(fileKey(file));
       syncFileInput(input, state[stateKey]);
       renderMediaPreview(state[stateKey], container, kind);
       if (kind === 'video') updateQualityResolution();
     });
-    card.append(media, info, remove);
+    card.append(media, info, tools, remove);
     container.append(card);
     if (isVideo(file)) {
       readVideoMetadata(file).then((metadata) => {
@@ -254,6 +276,10 @@ function appendSelectedFiles(kind, input, newFiles, maxFiles, container) {
     if (!known.has(fileKey(file)) && merged.length < maxFiles) {
       merged.push(file);
       known.add(fileKey(file));
+      if (kind === 'image') {
+        const hasFace = [...state.referenceRoles.values()].includes('face');
+        state.referenceRoles.set(fileKey(file), hasFace ? 'product' : 'face');
+      }
     }
   }
   if (newFiles.length && merged.length >= maxFiles && new Set([...state[stateKey], ...newFiles].map(fileKey)).size > maxFiles) {
@@ -264,6 +290,109 @@ function appendSelectedFiles(kind, input, newFiles, maxFiles, container) {
   renderMediaPreview(merged, container, kind);
   if (kind === 'video') updateQualityResolution();
 }
+
+function drawProductBox() {
+  const canvas = $('#productBoxCanvas');
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (boxPicker.frame) context.drawImage(boxPicker.frame, 0, 0, canvas.width, canvas.height);
+  if (!boxPicker.rect) return;
+  const { x1, y1, x2, y2 } = boxPicker.rect;
+  context.fillStyle = 'rgba(120, 230, 197, .18)';
+  context.strokeStyle = '#78e6c5';
+  context.lineWidth = Math.max(2, canvas.width / 400);
+  context.fillRect(x1, y1, x2 - x1, y2 - y1);
+  context.strokeRect(x1, y1, x2 - x1, y2 - y1);
+}
+
+function canvasPoint(event) {
+  const canvas = $('#productBoxCanvas');
+  const bounds = canvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(canvas.width, (event.clientX - bounds.left) * canvas.width / bounds.width)),
+    y: Math.max(0, Math.min(canvas.height, (event.clientY - bounds.top) * canvas.height / bounds.height)),
+  };
+}
+
+function closeProductBoxPicker() {
+  if (boxPicker.objectUrl) URL.revokeObjectURL(boxPicker.objectUrl);
+  boxPicker.file = null;
+  boxPicker.frame = null;
+  boxPicker.rect = null;
+  boxPicker.start = null;
+  boxPicker.objectUrl = null;
+  $('#productBoxDialog').close();
+}
+
+function openProductBoxPicker(file) {
+  const dialog = $('#productBoxDialog');
+  const canvas = $('#productBoxCanvas');
+  const video = document.createElement('video');
+  boxPicker.file = file;
+  boxPicker.frame = null;
+  boxPicker.rect = null;
+  boxPicker.objectUrl = URL.createObjectURL(file);
+  $('#productBoxFile').textContent = `${file.name}：在首帧拖动鼠标，完整框住要替换的商品。`;
+  dialog.showModal();
+  video.muted = true;
+  video.preload = 'auto';
+  video.src = boxPicker.objectUrl;
+  const capture = () => {
+    if (!video.videoWidth || !video.videoHeight) return;
+    const scale = Math.min(1, 1280 / video.videoWidth);
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    boxPicker.frame = video;
+    const saved = state.productBoxes.get(fileKey(file));
+    if (saved) {
+      boxPicker.rect = {
+        x1: saved[0] * canvas.width, y1: saved[1] * canvas.height,
+        x2: saved[2] * canvas.width, y2: saved[3] * canvas.height,
+      };
+    }
+    drawProductBox();
+  };
+  video.addEventListener('loadeddata', capture, { once: true });
+}
+
+const productCanvas = $('#productBoxCanvas');
+productCanvas.addEventListener('pointerdown', (event) => {
+  if (!boxPicker.frame) return;
+  productCanvas.setPointerCapture(event.pointerId);
+  boxPicker.start = canvasPoint(event);
+  boxPicker.rect = { x1: boxPicker.start.x, y1: boxPicker.start.y, x2: boxPicker.start.x, y2: boxPicker.start.y };
+  drawProductBox();
+});
+productCanvas.addEventListener('pointermove', (event) => {
+  if (!boxPicker.start) return;
+  const point = canvasPoint(event);
+  boxPicker.rect = {
+    x1: Math.min(boxPicker.start.x, point.x), y1: Math.min(boxPicker.start.y, point.y),
+    x2: Math.max(boxPicker.start.x, point.x), y2: Math.max(boxPicker.start.y, point.y),
+  };
+  drawProductBox();
+});
+productCanvas.addEventListener('pointerup', () => { boxPicker.start = null; });
+$('#clearProductBox').addEventListener('click', () => { boxPicker.rect = null; drawProductBox(); });
+$('#cancelProductBox').addEventListener('click', closeProductBoxPicker);
+$('#productBoxDialog').addEventListener('cancel', (event) => {
+  event.preventDefault();
+  closeProductBoxPicker();
+});
+$('#saveProductBox').addEventListener('click', () => {
+  const canvas = $('#productBoxCanvas');
+  const rect = boxPicker.rect;
+  if (!boxPicker.file || !rect || rect.x2 - rect.x1 < 8 || rect.y2 - rect.y1 < 8) {
+    toast('请先拖动鼠标框住原商品');
+    return;
+  }
+  state.productBoxes.set(fileKey(boxPicker.file), [
+    rect.x1 / canvas.width, rect.y1 / canvas.height,
+    rect.x2 / canvas.width, rect.y2 / canvas.height,
+  ]);
+  closeProductBoxPicker();
+  renderMediaPreview(state.selectedVideos, $('#videoPreview'), 'video');
+});
 
 function renderTasks() {
   const list = $('#taskList');
@@ -300,7 +429,8 @@ function renderTasks() {
       ? qualityDimensions[task.quality || 'low']?.[task.aspect_ratio] : null;
     const resolution = task.output_width && task.output_height
       ? `${task.output_width}×${task.output_height}`
-      : (presetSize ? `${presetSize[0]}×${presetSize[1]}` : '等待计算尺寸');
+      : (task.precision_mode ? '跟随原视频' : (presetSize ? `${presetSize[0]}×${presetSize[1]}` : '等待计算尺寸'));
+    const mode = task.precision_mode ? '精准局部替换' : 'H3 整段复刻';
     const elapsed = task.started_at
       ? `<span class="task-elapsed" data-elapsed-start="${escapeHtml(task.started_at)}" data-elapsed-finish="${escapeHtml(task.finished_at || '')}">${escapeHtml(elapsedLabel(task.started_at, task.finished_at || ''))}</span>`
       : '';
@@ -311,7 +441,7 @@ function renderTasks() {
           <span class="badge ${escapeHtml(task.status)}">${escapeHtml(status)}</span>
         </div>
         <div class="task-meta">
-          ${queue}<span>${formatSeconds(task.duration)} 秒${segments} · ${escapeHtml(task.aspect_ratio)} · ${escapeHtml(quality)} ${escapeHtml(resolution)}</span>
+          ${queue}<span>${formatSeconds(task.duration)} 秒${segments} · ${escapeHtml(mode)} · ${escapeHtml(quality)} ${escapeHtml(resolution)}</span>
           <span>${escapeHtml(task.source_video)}</span><span>${formatTime(task.created_at)}</span>${elapsed}
         </div>
         ${error}
@@ -421,6 +551,12 @@ $('#singleForm').addEventListener('submit', async (event) => {
     if (!videos.length) throw new Error('请至少上传一个视频');
     if (videos.length > 3) throw new Error('上传视频最多选择 3 个');
     if (state.selectedImages.length > 9) throw new Error('参考图片最多上传 9 张');
+    const referenceRoles = state.selectedImages.map((file) => state.referenceRoles.get(fileKey(file)) || 'face');
+    const hasProductReference = referenceRoles.includes('product');
+    if (hasProductReference) {
+      const missingBox = videos.find((file) => !state.productBoxes.has(fileKey(file)));
+      if (missingBox) throw new Error(`请先为 ${missingBox.name} 框选原商品`);
+    }
     const durations = await Promise.all(videos.map(readVideoDuration));
     const invalidIndex = durations.findIndex((duration) => duration < 4);
     if (invalidIndex >= 0) {
@@ -429,10 +565,15 @@ $('#singleForm').addEventListener('submit', async (event) => {
     const body = new FormData(form);
     if (!body.get('seed')) body.delete('seed');
     body.append('video_durations', JSON.stringify(durations));
+    body.append('reference_roles', JSON.stringify(referenceRoles));
+    body.append('product_boxes', JSON.stringify(videos.map((file) => state.productBoxes.get(fileKey(file)) || null)));
+    body.append('precision_mode', 'true');
     const data = await api('/api/tasks', { method: 'POST', body });
     form.reset();
     state.selectedVideos = [];
     state.selectedImages = [];
+    state.referenceRoles.clear();
+    state.productBoxes.clear();
     clearMediaPreview($('#videoPreview'));
     clearMediaPreview($('#imagePreview'));
     updateQualityResolution();

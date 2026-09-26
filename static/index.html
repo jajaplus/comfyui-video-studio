@@ -13,7 +13,7 @@
       <div>
         <div class="eyebrow">MINIMAX H3 · REF2VA</div>
         <h1>视频替换工作台</h1>
-        <p>上传视频与参考图片，批量复刻动作、镜头和声音并替换人物或商品。</p>
+        <p>保留原视频动作、身体和场景，精准替换脸部与原商品区域。</p>
       </div>
       <div class="health" id="health"><span></span><b>正在连接</b></div>
     </header>
@@ -56,16 +56,17 @@
             <div class="file-field required">
               <label class="file-label" for="uploadVideos">上传视频</label>
               <input id="uploadVideos" name="upload_videos" type="file" accept="video/*,.mkv" multiple required>
-              <p>可多次选择并追加，最多 3 个。视频不能短于 4 秒；超过 15 秒会自动分段生成并合并。</p>
+              <p>可多次选择并追加，最多 3 个。添加商品参考图后，需要在每个视频首帧框选原商品。</p>
             </div>
             <div id="videoPreview" class="media-preview hidden"></div>
             <div class="file-field">
               <label for="referenceImages">参考图片</label>
               <input id="referenceImages" name="reference_images" type="file" accept="image/png,image/jpeg,image/webp" multiple>
-              <p>可多次选择并追加。人物和商品图片统一上传，最多 9 张。</p>
+              <p>可多次选择并追加，最多 9 张。请在每张图片下方选择“脸部”或“商品”。</p>
             </div>
             <div id="imagePreview" class="media-preview hidden"></div>
-            <label>提示词<textarea name="prompt" rows="4" placeholder="例如：Picture 1 用于替换人物，Picture 2 用于替换手中的商品；保持上传视频的场景、动作、运镜和声音。"></textarea></label>
+            <label>提示词<textarea name="prompt" rows="4" placeholder="例如：Picture 1 只用于替换模特脸部，Picture 2 用于替换模特手中的商品。保留原模特的头发、身体、服装、姿势、位置和动作。"></textarea></label>
+            <p class="prompt-help">类型由参考图下方的选项确定。提示词可补充商品替换要求；系统保留原视频的身体、服装、动作、位置、背景和声音。</p>
             <div class="three-col">
               <label>画面比例
                 <select name="aspect_ratio">
@@ -113,13 +114,29 @@
       </section>
 
       <aside class="notice">
-        <b>生成边界</b>
-        <p>Ref2VA 单次生成支持 4–15 秒。更长的视频会切成多个片段依次生成，再自动合并；片段连接处可能出现轻微画面或声音跳变。</p>
+        <b>精准替换</b>
+        <p>商品先由 MiniMax-H3 生成候选画面，再由 SAM2 跟踪你框选的原商品并只合成该区域；脸部最后由 FaceFusion 替换，成片恢复原视频声音。</p>
       </aside>
     </main>
   </div>
 
+  <dialog id="productBoxDialog">
+    <div class="box-dialog">
+      <div>
+        <h2>框选原商品</h2>
+        <p id="productBoxFile">在视频首帧拖动鼠标，完整框住要替换的商品。</p>
+      </div>
+      <div class="box-canvas-wrap"><canvas id="productBoxCanvas"></canvas></div>
+      <p class="box-tip">框可以稍微包含商品边缘，但不要包含模特的脸或大面积身体。</p>
+      <div class="dialog-actions">
+        <button type="button" class="secondary" id="clearProductBox">重新框选</button>
+        <button type="button" class="secondary" id="cancelProductBox">取消</button>
+        <button type="button" class="primary" id="saveProductBox">保存商品框</button>
+      </div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast hidden"></div>
-  <script src="/app.js?v=9" defer></script>
+  <script src="/app.js?v=11" defer></script>
 </body>
 </html>

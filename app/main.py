@@ -44,6 +44,29 @@ COMFYUI_WORKFLOW = Path(
     os.getenv("H3_COMFYUI_WORKFLOW", ROOT / "workflows" / "minimax_h3_ref2va_api.json")
 ).resolve()
 COMFYUI_TIMEOUT = max(300, int(os.getenv("H3_COMFYUI_TIMEOUT", "10800")))
+PRECISION_TOOLS_DIR = Path(
+    os.getenv("H3_PRECISION_TOOLS_DIR", "/root/autodl-tmp/h3-precision-tools")
+).resolve()
+SAM2_PYTHON = Path(
+    os.getenv("H3_SAM2_PYTHON", PRECISION_TOOLS_DIR / "sam2-env" / "bin" / "python")
+).resolve()
+SAM2_SCRIPT = Path(
+    os.getenv("H3_SAM2_SCRIPT", ROOT / "scripts" / "sam2_product_composite.py")
+).resolve()
+SAM2_MODEL_ID = os.getenv("H3_SAM2_MODEL_ID", "facebook/sam2.1-hiera-small")
+SAM2_CHECKPOINT = Path(
+    os.getenv(
+        "H3_SAM2_CHECKPOINT",
+        PRECISION_TOOLS_DIR / "models" / "sam2.1_hiera_small.pt",
+    )
+).resolve()
+SAM2_CONFIG = os.getenv("H3_SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml")
+FACEFUSION_DIR = Path(
+    os.getenv("H3_FACEFUSION_DIR", PRECISION_TOOLS_DIR / "facefusion")
+).resolve()
+FACEFUSION_PYTHON = Path(
+    os.getenv("H3_FACEFUSION_PYTHON", PRECISION_TOOLS_DIR / "facefusion-env" / "bin" / "python")
+).resolve()
 COMFYUI_UNET = os.getenv(
     "H3_COMFYUI_UNET", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 )
@@ -125,7 +148,10 @@ def init_db() -> None:
                 current_segment INTEGER NOT NULL DEFAULT 0,
                 quality TEXT NOT NULL DEFAULT 'low',
                 output_width INTEGER,
-                output_height INTEGER
+                output_height INTEGER,
+                reference_roles TEXT,
+                product_box TEXT,
+                precision_mode INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_queue
                 ON tasks(status, deleted_at, created_at);
@@ -147,6 +173,12 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN output_width INTEGER")
         if "output_height" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN output_height INTEGER")
+        if "reference_roles" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN reference_roles TEXT")
+        if "product_box" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN product_box TEXT")
+        if "precision_mode" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN precision_mode INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             "UPDATE tasks SET status='queued', progress=0, stage='等待队列', started_at=NULL, "
             "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
@@ -258,7 +290,14 @@ def task_to_dict(row: sqlite3.Row, queue_position: int | None = None) -> dict[st
         if result.get(field):
             result[field] = media_display_name(result[field])
     result["reference_images"] = [media_display_name(path) for path in row_reference_paths(row)]
+    result["reference_roles"] = row_reference_roles(row)
+    if result.get("product_box"):
+        try:
+            result["product_box"] = json.loads(result["product_box"])
+        except (TypeError, json.JSONDecodeError):
+            result["product_box"] = None
     result["cancel_requested"] = bool(result["cancel_requested"])
+    result["precision_mode"] = bool(result.get("precision_mode"))
     result["queue_position"] = queue_position
     result["download_url"] = f"/api/tasks/{row['id']}/output" if row["status"] == "completed" else None
     return result
@@ -267,6 +306,8 @@ def task_to_dict(row: sqlite3.Row, queue_position: int | None = None) -> dict[st
 def insert_task(
     *, prompt: str, source_video: str | Path, reference_images: list[str | Path], duration: float,
     aspect_ratio: str, seed: int | None, quality: str = "low", display_name: str | None = None,
+    reference_roles: list[str] | None = None, product_box: list[float] | None = None,
+    precision_mode: bool = True,
 ) -> str:
     validate_task_values(duration, aspect_ratio, quality)
     source_text = str(source_video)
@@ -278,6 +319,22 @@ def insert_task(
             raise ValueError("upload_video 必须是已上传的受支持视频文件")
     if len(reference_images) > 9:
         raise ValueError("参考图片最多上传 9 张")
+    roles = list(reference_roles or [])
+    if roles and len(roles) != len(reference_images):
+        raise ValueError("参考图片角色数量与图片数量不一致")
+    if not roles:
+        roles = ["auto"] * len(reference_images)
+    if any(role not in {"face", "product", "auto"} for role in roles):
+        raise ValueError("参考图片角色必须是 face、product 或 auto")
+    if product_box is not None:
+        if len(product_box) != 4 or any(not math.isfinite(float(value)) for value in product_box):
+            raise ValueError("商品框格式不正确")
+        product_box = [float(value) for value in product_box]
+        x1, y1, x2, y2 = product_box
+        if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+            raise ValueError("商品框必须使用 0–1 的归一化坐标")
+    if precision_mode and "product" in roles and product_box is None:
+        raise ValueError("使用商品参考图时，必须在视频首帧框选原商品")
     for image in reference_images:
         image_text = str(image)
         if is_http_url(image_text):
@@ -296,25 +353,50 @@ def insert_task(
             """INSERT INTO tasks (
                 id,name,status,prompt,source_video,reference_images,
                 duration,aspect_ratio,source_start,seed,stage,segment_count,current_segment,quality,
-                created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                reference_roles,product_box,precision_mode,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task_id, name or f"视频-{task_id[:6]}", "queued", prompt.strip(),
                 source_text, json.dumps([str(path) for path in reference_images], ensure_ascii=False),
-                duration, aspect_ratio, 0, actual_seed, "等待队列", part_count, 0, quality, now, now,
+                duration, aspect_ratio, 0, actual_seed, "等待队列", part_count, 0, quality,
+                json.dumps(roles, ensure_ascii=False),
+                json.dumps(product_box) if product_box is not None else None,
+                1 if precision_mode else 0,
+                now, now,
             ),
         )
     return task_id
 
 
-def row_reference_paths(row: sqlite3.Row | dict[str, Any]) -> list[str]:
+def row_reference_roles(row: sqlite3.Row | dict[str, Any]) -> list[str]:
+    keys = set(row.keys())
+    raw = row["reference_roles"] if "reference_roles" in keys else None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(role) for role in parsed]
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return []
+
+
+def row_reference_paths(
+    row: sqlite3.Row | dict[str, Any], role: str | None = None
+) -> list[str]:
     keys = set(row.keys())
     raw = row["reference_images"] if "reference_images" in keys else None
     if raw:
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
-                return [str(path) for path in parsed if path]
+                paths = [str(path) for path in parsed if path]
+                if role is None:
+                    return paths
+                roles = row_reference_roles(row)
+                if len(roles) != len(paths):
+                    return []
+                return [path for path, item_role in zip(paths, roles) if item_role == role]
         except (TypeError, json.JSONDecodeError):
             pass
     legacy = []
@@ -326,33 +408,36 @@ def row_reference_paths(row: sqlite3.Row | dict[str, Any]) -> list[str]:
 
 def build_h3_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
     definitions = [
-        "<Video 1> is the source video. Preserve its shot order, camera motion, subject motion, "
-        "timing, composition, lighting, background, and synchronized soundtrack unless explicitly changed below."
+        "<Video 1> is the authoritative source video and the ground truth for every frame. "
+        "Keep its exact shot order, people, body motion, timing, framing, camera motion, lighting, background, and soundtrack."
     ]
     reference_paths = row_reference_paths(row)
-    instructions: list[str] = []
     for picture_index, _ in enumerate(reference_paths, start=1):
         definitions.append(
-            f"<Picture {picture_index}> is a user-provided visual reference for the replacement person, product, or both."
+            f"<Picture {picture_index}> is an appearance reference only. Use the user's mapping to decide whether it supplies "
+            "a face identity or a product appearance. Never copy its pose, body, clothing, background, camera, or composition."
         )
-    if reference_paths:
-        instructions.append(
-            "Use the supplied <Picture> references according to the user's request. For a person, preserve identity, face, hair, "
-            "pose, motion, gaze, scale, placement, and timing. For a product, preserve category, shape, colors, branding, packaging, "
-            "perspective, occlusion, hand contact, reflections, shadows, and temporal consistency."
-        )
-    if not instructions:
-        instructions.append("Apply the requested edit to <Video 1> while preserving all unspecified content.")
-
-    user_request = row["prompt"].strip() or "Keep the result natural, photorealistic, and temporally consistent."
+    user_request = row["prompt"].strip() or (
+        "Infer which supplied pictures show a face/person and which show a product. "
+        "Use face/person pictures only for facial identity, and product pictures only for the existing product."
+    )
     return (
         "subject_definitions:\n" + "\n".join(definitions) +
-        "\n\nsummary:\n[video editing + identity/product reference + audio reuse] "
-        "The target is a faithful edited version of <Video 1>. " + " ".join(instructions) +
-        " Preserve the original environment and synchronized audio. Do not add extra people, products, text, logos, cuts, or camera moves."
-        "\n\nretention_analysis:\n<Video 1>: fully_preserved except for the explicitly requested replacements. "
-        "Motion, timing, framing, background, lighting, and audio remain consistent."
-        "\n\ndetailed_description:\n" + user_request
+        "\n\nedit_scope:\n"
+        "Perform a localized face-and-product edit of <Video 1>, not a person replacement and not a scene recreation. "
+        "For a face reference, change only the visible facial identity and facial appearance inside the original face region. "
+        "Keep the original person's hair, head position, body, skin outside the face, clothing, pose, gestures, gaze direction, "
+        "scale, location, motion, and visibility. For a product reference, replace only the pixels belonging to the original product. "
+        "Keep the product in the exact original location and preserve its size, orientation, motion, perspective, hand contact, "
+        "occlusion, reflections, and shadows. When the original face or product is occluded or outside the frame, keep it occluded or absent."
+        "\n\nhard_constraints:\n"
+        "Every person visible in <Video 1> must remain visible in exactly the same frames. The main model must never disappear, "
+        "be replaced by an empty background, become a different full body, or change clothes. Never add or remove a person, limb, "
+        "product, shot, cut, logo, text, or camera move. Preserve the background, lighting, timing, motion, framing, and synchronized audio. "
+        "If any replacement is uncertain, preserve the original source pixels and subject presence instead of inventing content."
+        "\n\nuser_mapping_and_request:\n" + user_request +
+        "\n\nfinal_priority:\nSource-video structure and subject presence have higher priority than reference-image appearance. "
+        "The only permitted visual changes are the requested face identity and existing product appearance."
     )
 
 
@@ -617,6 +702,21 @@ def source_aspect_ratio(source: str | Path) -> str:
         return "16:9"
 
 
+def probe_video_dimensions(source: str | Path) -> tuple[int, int] | None:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(source),
+            ],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        width, height = (int(value) for value in completed.stdout.strip().split("x", 1))
+        return (width, height) if width > 0 and height > 0 else None
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def next_workflow_node_id(workflow: dict[str, Any]) -> str:
     return str(max(int(node_id) for node_id in workflow) + 1)
 
@@ -738,6 +838,134 @@ def run_ffmpeg(arguments: list[str], purpose: str) -> None:
         raise RuntimeError(f"{purpose}失败：{detail}")
 
 
+def run_external_command(
+    command: list[str], purpose: str, cwd: Path | None = None,
+) -> None:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=COMFYUI_TIMEOUT,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{purpose}所需程序不存在：{command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{purpose}超时") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "未知错误").strip()[-4000:]
+        raise RuntimeError(f"{purpose}失败：{detail}")
+
+
+def parse_product_box(row: sqlite3.Row | dict[str, Any]) -> list[float] | None:
+    keys = set(row.keys())
+    raw = row["product_box"] if "product_box" in keys else None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(parsed, list) and len(parsed) == 4:
+            return [float(value) for value in parsed]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def unload_comfy_models() -> None:
+    try:
+        http_json(
+            "POST", f"{COMFYUI_URL}/free",
+            {"unload_models": True, "free_memory": True}, timeout=30,
+        )
+    except Exception:
+        pass
+
+
+def run_product_mask_composite(
+    source: Path, candidate: Path, product_box: list[float], destination: Path,
+    work_folder: Path,
+) -> None:
+    if not SAM2_PYTHON.is_file() or not SAM2_SCRIPT.is_file():
+        raise RuntimeError("SAM2 精准商品工具未安装，请运行 scripts/install_precision_tools.sh")
+    unload_comfy_models()
+    command = [
+            str(SAM2_PYTHON), str(SAM2_SCRIPT),
+            "--source", str(source),
+            "--candidate", str(candidate),
+            "--output", str(destination),
+            "--box", json.dumps(product_box),
+            "--model-id", SAM2_MODEL_ID,
+            "--work-dir", str(work_folder / "sam2"),
+        ]
+    if SAM2_CHECKPOINT.is_file():
+        command.extend(["--checkpoint", str(SAM2_CHECKPOINT), "--model-config", SAM2_CONFIG])
+    run_external_command(
+        command,
+        "SAM2 商品跟踪与蒙版合成",
+    )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError("SAM2 商品合成没有生成视频")
+
+
+def materialize_reference_images(
+    sources: list[str], work_folder: Path, prefix: str,
+) -> list[Path]:
+    results: list[Path] = []
+    for index, source in enumerate(sources, start=1):
+        suffix = Path(urlparse(source).path).suffix.lower() or ".jpg"
+        if suffix not in IMAGE_EXTENSIONS:
+            suffix = ".jpg"
+        destination = work_folder / f"{prefix}_{index:02d}{suffix}"
+        copy_media_to_comfy(source, destination)
+        results.append(destination)
+    return results
+
+
+def run_facefusion(
+    face_references: list[Path], target: Path, destination: Path, work_folder: Path,
+) -> None:
+    entrypoint = FACEFUSION_DIR / "facefusion.py"
+    if not FACEFUSION_PYTHON.is_file() or not entrypoint.is_file():
+        raise RuntimeError("FaceFusion 换脸工具未安装，请运行 scripts/install_precision_tools.sh")
+    unload_comfy_models()
+    run_external_command(
+        [
+            str(FACEFUSION_PYTHON), str(entrypoint), "headless-run",
+            "--source-paths", *[str(path) for path in face_references],
+            "--target-path", str(target),
+            "--output-path", str(destination),
+            "--processors", "face_swapper",
+            "--face-selector-mode", "one",
+            "--face-mask-types", "box", "occlusion", "region",
+            "--face-mask-blur", "0.15",
+            "--face-swapper-model", "inswapper_128_fp16",
+            "--face-swapper-pixel-boost", "256x256",
+            "--execution-providers", "cuda",
+            "--output-video-encoder", "libx264",
+            "--output-video-preset", "veryfast",
+            "--output-video-quality", "90",
+            "--temp-path", str(work_folder / "facefusion-temp"),
+            "--log-level", "info",
+        ],
+        "FaceFusion 人脸替换",
+        cwd=FACEFUSION_DIR,
+    )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError("FaceFusion 没有生成换脸视频")
+
+
+def restore_original_audio(processed: Path, source: Path, destination: Path) -> None:
+    run_ffmpeg(
+        [
+            "-i", str(processed), "-i", str(source),
+            "-map", "0:v:0", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac",
+            "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(destination),
+        ],
+        "恢复原视频声音",
+    )
+
+
 def split_source_video(source: Path, durations: list[float], work_folder: Path) -> list[Path]:
     work_folder.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
@@ -828,6 +1056,20 @@ def get_control_state(task_id: str) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT cancel_requested,deleted_at FROM tasks WHERE id=?", (task_id,)
         ).fetchone()
+
+
+def task_was_cancelled(task_id: str, destination: Path | None = None) -> bool:
+    control = get_control_state(task_id)
+    if control is not None and not control["cancel_requested"] and not control["deleted_at"]:
+        return False
+    if destination is not None:
+        destination.unlink(missing_ok=True)
+    if control is not None and not control["deleted_at"]:
+        mark_task(
+            task_id, status="cancelled", progress=0,
+            stage="任务已取消", finished_at=utcnow(), engine_job_id=None,
+        )
+    return True
 
 
 def mark_task(task_id: str, **values: Any) -> None:
@@ -954,10 +1196,95 @@ def process_task(row: sqlite3.Row) -> None:
     work_folder = WORK_DIR / task_id
     destination = OUTPUT_DIR / f"{task_id}.mp4"
     try:
+        precision_mode = bool(row["precision_mode"]) if "precision_mode" in row.keys() else False
+        face_sources = row_reference_paths(row, "face")
+        product_sources = row_reference_paths(row, "product")
+        explicit_roles = bool(face_sources or product_sources)
+        precision_mode = precision_mode and explicit_roles
         durations = segment_durations(float(row["duration"]))
-        segment_count = len(durations)
+        segment_count = len(durations) if (not precision_mode or product_sources) else 1
         mark_task(task_id, segment_count=segment_count, current_segment=0)
         work_folder.mkdir(parents=True, exist_ok=True)
+
+        if precision_mode:
+            mark_task(task_id, status="running", stage="读取原视频", progress=6)
+            local_source = local_source_for_split(row, work_folder)
+            dimensions = probe_video_dimensions(local_source)
+            if dimensions:
+                mark_task(task_id, output_width=dimensions[0], output_height=dimensions[1])
+
+            working_video = local_source
+            if product_sources:
+                product_box = parse_product_box(row)
+                if product_box is None:
+                    raise RuntimeError("缺少原商品框，请重新创建任务并在视频首帧框选商品")
+                if len(durations) > 1:
+                    mark_task(task_id, stage=f"正在切割源视频（共 {len(durations)} 段）", progress=7)
+                    source_parts: list[str | Path] = split_source_video(
+                        local_source, durations, work_folder / "source-parts"
+                    )
+                else:
+                    source_parts = [local_source]
+
+                product_row = dict(row)
+                product_row["reference_images"] = json.dumps(product_sources, ensure_ascii=False)
+                product_row["reference_roles"] = json.dumps(
+                    ["product"] * len(product_sources), ensure_ascii=False
+                )
+                generated_parts: list[Path] = []
+                for index, (source_part, part_duration) in enumerate(
+                    zip(source_parts, durations), start=1
+                ):
+                    segment_row = dict(product_row)
+                    segment_row["id"] = f"{task_id}_product_{index:03d}"
+                    segment_row["source_video"] = str(source_part)
+                    segment_row["duration"] = part_duration
+                    segment_destination = work_folder / f"product_candidate_{index:03d}.mp4"
+                    if not run_comfy_segment(
+                        task_id, segment_row, index, len(durations), segment_destination
+                    ):
+                        return
+                    generated_parts.append(segment_destination)
+
+                if task_was_cancelled(task_id, destination):
+                    return
+                candidate = work_folder / "product_candidate.mp4"
+                mark_task(
+                    task_id, progress=94,
+                    stage="合并商品候选片段" if len(generated_parts) > 1 else "准备商品候选视频",
+                )
+                concat_generated_videos(generated_parts, candidate, work_folder)
+                mark_task(task_id, status="running", progress=95, stage="SAM2 跟踪原商品区域")
+                product_composite = work_folder / "product_composite.mp4"
+                run_product_mask_composite(
+                    local_source, candidate, product_box, product_composite, work_folder
+                )
+                working_video = product_composite
+
+            if task_was_cancelled(task_id, destination):
+                return
+            if face_sources:
+                mark_task(task_id, status="running", progress=97, stage="准备人脸参考图")
+                face_references = materialize_reference_images(
+                    face_sources, work_folder, "face_reference"
+                )
+                face_output = work_folder / "face_swapped.mp4"
+                mark_task(task_id, progress=98, stage="FaceFusion 替换脸部")
+                run_facefusion(face_references, working_video, face_output, work_folder)
+                working_video = face_output
+
+            if task_was_cancelled(task_id, destination):
+                return
+            mark_task(task_id, progress=99, stage="恢复原视频声音")
+            restore_original_audio(working_video, local_source, destination)
+            if task_was_cancelled(task_id, destination):
+                return
+            mark_task(
+                task_id, status="completed", progress=100, output_path=str(destination),
+                stage="精准替换完成", current_segment=segment_count, engine_job_id=None,
+                finished_at=utcnow(), error=None,
+            )
+            return
 
         if segment_count > 1:
             mark_task(task_id, stage=f"正在切割源视频（共 {segment_count} 段）", progress=6)
@@ -979,24 +1306,11 @@ def process_task(row: sqlite3.Row) -> None:
                 return
             generated_parts.append(segment_destination)
 
-        control = get_control_state(task_id)
-        if control is None or control["cancel_requested"] or control["deleted_at"]:
-            if control is not None and not control["deleted_at"]:
-                mark_task(
-                    task_id, status="cancelled", progress=0,
-                    stage="任务已取消", finished_at=utcnow(),
-                )
+        if task_was_cancelled(task_id, destination):
             return
         mark_task(task_id, progress=96, stage="合并生成片段" if segment_count > 1 else "保存生成视频")
         concat_generated_videos(generated_parts, destination, work_folder)
-        control = get_control_state(task_id)
-        if control is None or control["cancel_requested"] or control["deleted_at"]:
-            destination.unlink(missing_ok=True)
-            if control is not None and not control["deleted_at"]:
-                mark_task(
-                    task_id, status="cancelled", progress=0,
-                    stage="任务已取消", finished_at=utcnow(),
-                )
+        if task_was_cancelled(task_id, destination):
             return
         mark_task(
             task_id, status="completed", progress=100, output_path=str(destination),
@@ -1035,7 +1349,7 @@ async def lifespan(_: FastAPI):
         worker_thread.join(timeout=5)
 
 
-app = FastAPI(title="MiniMax H3 Video Studio", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="MiniMax H3 Video Studio", version="3.0.0", lifespan=lifespan)
 
 
 @app.get("/api/config")
@@ -1080,6 +1394,9 @@ async def create_manual_task(
     quality: Annotated[str, Form()] = "low",
     seed: Annotated[int | None, Form()] = None,
     video_durations: Annotated[str, Form()] = "[]",
+    reference_roles: Annotated[str, Form()] = "[]",
+    product_boxes: Annotated[str, Form()] = "[]",
+    precision_mode: Annotated[bool, Form()] = True,
 ) -> dict[str, Any]:
     if not upload_videos or not any(item.filename for item in upload_videos):
         raise HTTPException(400, "请至少上传一个视频")
@@ -1092,6 +1409,16 @@ async def create_manual_task(
         duration_hints = [float(value) for value in hints_raw] if isinstance(hints_raw, list) else []
     except (json.JSONDecodeError, TypeError, ValueError):
         duration_hints = []
+    try:
+        roles_raw = json.loads(reference_roles)
+        parsed_roles = [str(value) for value in roles_raw] if isinstance(roles_raw, list) else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed_roles = []
+    try:
+        boxes_raw = json.loads(product_boxes)
+        parsed_boxes = boxes_raw if isinstance(boxes_raw, list) else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed_boxes = []
     task_folder = UPLOAD_DIR / uuid.uuid4().hex
     created: list[str] = []
     try:
@@ -1114,12 +1441,19 @@ async def create_manual_task(
             duration = probe_video_duration(saved_video, hint)
             prepared.append((saved_video, original_name, duration))
 
+        if saved_references and not parsed_roles:
+            parsed_roles = ["auto"] * len(saved_references)
+            precision_mode = False
+        elif saved_references and len(parsed_roles) != len(saved_references):
+            raise ValueError("请为每张参考图片选择“脸部”或“商品”")
         validate_task_values(prepared[0][2], aspect_ratio, quality)
-        for saved_video, original_name, duration in prepared:
+        for video_index, (saved_video, original_name, duration) in enumerate(prepared):
+            product_box = parsed_boxes[video_index] if video_index < len(parsed_boxes) else None
             created.append(insert_task(
                 prompt=prompt, source_video=saved_video, reference_images=saved_references,
                 duration=duration, aspect_ratio=aspect_ratio, seed=seed, quality=quality,
-                display_name=original_name,
+                display_name=original_name, reference_roles=parsed_roles,
+                product_box=product_box, precision_mode=precision_mode,
             ))
         return {"created": len(created), "task_ids": created, "status": "queued"}
     except HTTPException:
@@ -1183,6 +1517,21 @@ async def import_excel_tasks(
                 ]
                 if len(reference_urls) > 9:
                     raise ValueError("reference_image_urls 最多填写 9 个图片 URL")
+                reference_roles = [
+                    item.strip().lower()
+                    for item in re.split(r"[,，;；\n]+", text_cell(cell("reference_roles"))) if item.strip()
+                ]
+                if reference_urls and len(reference_roles) != len(reference_urls):
+                    raise ValueError("reference_roles 必须与参考图片逐行对应")
+                if any(role not in {"face", "product"} for role in reference_roles):
+                    raise ValueError("reference_roles 只能填写 face 或 product")
+                product_box_text = text_cell(cell("product_box"))
+                product_box = None
+                if product_box_text:
+                    values_box = [item.strip() for item in re.split(r"[,，]+", product_box_text)]
+                    if len(values_box) != 4:
+                        raise ValueError("product_box 必须填写 x1,y1,x2,y2 四个 0–1 坐标")
+                    product_box = [float(value) for value in values_box]
                 duration = probe_video_duration(source_url)
                 aspect_ratio = text_cell(cell("aspect_ratio")) or "auto"
                 quality = text_cell(cell("quality")) or "low"
@@ -1191,6 +1540,7 @@ async def import_excel_tasks(
                     prompt=text_cell(cell("prompt")), source_video=source_url,
                     reference_images=reference_urls, duration=duration, aspect_ratio=aspect_ratio,
                     seed=seed, quality=quality, display_name=media_display_name(source_url),
+                    reference_roles=reference_roles, product_box=product_box, precision_mode=True,
                 )
                 created.append(task_id)
             except Exception as exc:
@@ -1267,12 +1617,16 @@ def excel_template() -> StreamingResponse:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "任务"
-    headers = ["upload_video_url", "reference_image_urls", "prompt", "aspect_ratio", "quality", "seed"]
+    headers = [
+        "upload_video_url", "reference_image_urls", "reference_roles", "product_box",
+        "prompt", "aspect_ratio", "quality", "seed",
+    ]
     sheet.append(headers)
     sheet.append([
         "https://your-domain.example/videos/source.mp4",
         "https://your-domain.example/images/person.jpg\nhttps://your-domain.example/images/product.png",
-        "保持上传视频的场景和运镜，用参考图片替换人物和商品，包装文字尽量清晰。", "auto", "low", "",
+        "face\nproduct", "0.42,0.46,0.72,0.88",
+        "把框选的原商品替换成商品参考图，并保持手部遮挡自然。", "auto", "low", "",
     ])
     header_fill = PatternFill("solid", fgColor="253449")
     for cell in sheet[1]:
@@ -1283,30 +1637,34 @@ def excel_template() -> StreamingResponse:
         cell.fill = PatternFill("solid", fgColor="FFF4CC")
         cell.alignment = Alignment(vertical="top", wrap_text=True)
     sheet.row_dimensions[2].height = 38
-    widths = [52, 62, 72, 18, 18, 18]
+    widths = [52, 62, 24, 28, 62, 18, 18, 18]
     for i, width in enumerate(widths, start=1):
         sheet.column_dimensions[chr(64 + i)].width = width
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = "A1:E2"
+    sheet.auto_filter.ref = "A1:H2"
     sheet["A1"].comment = Comment(
         "必填；用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。",
         "MiniMax H3 Studio",
     )
     sheet["B1"].comment = Comment("可选；用户自行提供人物或商品图片 URL，每行一个，最多 9 个。", "MiniMax H3 Studio")
-    sheet["E1"].comment = Comment("可选；low、standard 或 high。默认 low，速度最快。", "MiniMax H3 Studio")
+    sheet["C1"].comment = Comment("有参考图时必填；与图片逐行对应，只能填 face 或 product。", "MiniMax H3 Studio")
+    sheet["D1"].comment = Comment("使用 product 时必填；视频首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "MiniMax H3 Studio")
+    sheet["G1"].comment = Comment("可选；low、standard 或 high。默认 low，速度最快。", "MiniMax H3 Studio")
     ratio_validation = DataValidation(type="list", formula1='"auto,16:9,9:16,1:1,4:3,3:4,21:9"')
     sheet.add_data_validation(ratio_validation)
-    ratio_validation.add("D2:D1000")
+    ratio_validation.add("F2:F1000")
     quality_validation = DataValidation(type="list", formula1='"low,standard,high"')
     sheet.add_data_validation(quality_validation)
-    quality_validation.add("E2:E1000")
+    quality_validation.add("G2:G1000")
 
     guide = workbook.create_sheet("字段说明")
     guide.append(["字段", "是否必填", "说明"])
     guide_rows = [
         ("upload_video_url", "是", "用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。"),
         ("reference_image_urls", "否", "用户自行提供人物和商品参考图片 URL；每行一个，最多 9 个。"),
-        ("prompt", "否", "说明每张参考图片用于替换人物还是商品，并填写其他保留要求。"),
+        ("reference_roles", "有参考图时是", "与 reference_image_urls 逐行对应。脸部图填 face，商品图填 product。"),
+        ("product_box", "有商品图时是", "首帧原商品框，填写 0–1 坐标 x1,y1,x2,y2。例如 0.42,0.46,0.72,0.88。"),
+        ("prompt", "否", "补充商品外观或替换要求，不需要再说明图片类型。"),
         ("aspect_ratio", "否", "默认 auto，跟随上传视频比例；也可指定固定比例。"),
         ("quality", "否", "清晰度：low（低清，默认且最快）、standard（标清）或 high（高清且最慢）。"),
         ("seed", "否", "固定随机种子便于复现；空白时自动生成。"),
