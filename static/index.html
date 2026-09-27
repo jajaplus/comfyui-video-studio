@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MiniMax H3 视频工作台</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2378e6c5'/%3E%3Cpath d='M16 18h8v11h16V18h8v28h-8V36H24v10h-8z' fill='%23071018'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/styles.css?v=14">
+  <title>VACE 精准视频替换工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2378e6c5'/%3E%3Cpath d='M14 16h9l9 29 9-29h9L38 49H26z' fill='%23071018'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css?v=17">
 </head>
 <body>
   <div class="shell">
     <header class="topbar">
       <div>
-        <div class="eyebrow">MINIMAX H3 · REF2VA</div>
-        <h1>视频替换工作台</h1>
+        <div class="eyebrow">WAN VACE · MASKED VIDEO EDITING</div>
+        <h1>精准视频替换工作台</h1>
         <p>保留原视频动作、身体和场景，精准替换脸部与原商品区域。</p>
       </div>
       <div class="health" id="health"><span></span><b>正在连接</b></div>
@@ -64,68 +64,70 @@
               <p>可多次选择并追加，最多 3 个。AI 默认自动识别要替换的商品；识别不准时可在视频预览下方手动修正区域。</p>
             </div>
             <div id="videoPreview" class="media-preview hidden"></div>
-            <div class="file-field">
+            <div class="file-field required">
               <label for="referenceImages">参考图片</label>
-              <input id="referenceImages" name="reference_images" type="file" accept="image/png,image/jpeg,image/webp" multiple>
-              <p>可多次选择并追加，最多 9 张。请在每张图片下方选择“脸部”或“商品”。</p>
+              <input id="referenceImages" name="reference_images" type="file" accept="image/png,image/jpeg,image/webp" multiple required>
+              <p>可多次选择并追加。脸部参考图和商品参考图各最多 1 张，共最多 2 张。</p>
             </div>
             <div id="imagePreview" class="media-preview hidden"></div>
             <label>提示词<textarea name="prompt" rows="4" placeholder="例如：将视频中的人物脸部换成参考图1，人物身上的上衣换成参考图2。保留原模特的头发、身体、姿势、位置和动作。"></textarea></label>
             <p class="prompt-help">类型由参考图下方的选项确定。请写清原视频里要替换的商品类型或位置，例如“人物身上的上衣”；系统会自动定位并保留其余身体、动作、背景和声音。</p>
-            <div class="three-col">
-              <label>画面比例
-                <select name="aspect_ratio">
-                  <option selected>auto</option><option>16:9</option><option>9:16</option><option>1:1</option>
-                  <option>4:3</option><option>3:4</option><option>21:9</option>
-                </select>
-              </label>
-              <label>视频清晰度
-                <select name="quality">
-                  <option value="low" selected>低清 · 672×384（16:9）</option>
-                  <option value="standard">标清 · 832×480（16:9）</option>
-                  <option value="high">高清 · 1344×768（16:9）</option>
-                </select>
-              </label>
-              <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
-            </div>
-            <p class="resolution-hint" id="qualityResolution">预计输出尺寸：672×384</p>
             <details class="generation-settings">
               <summary>
                 <span>
                   <strong id="generationSettingsTitle">生成参数</strong>
-                  <small>默认参数适配 MiniMax-H3</small>
+                  <small id="generationSettingsDescription">建议 50 Steps，以获得更稳定的替换效果</small>
                 </span>
                 <span class="settings-toggle"><span class="settings-open-label">展开</span><span class="settings-close-label">收起</span></span>
               </summary>
-              <div class="four-col generation-settings-fields">
-                <label>Scheduler
-                  <select name="scheduler">
-                    <option value="simple" selected>simple（默认）</option>
-                    <option value="normal">normal</option>
-                    <option value="karras">karras</option>
-                    <option value="exponential">exponential</option>
-                    <option value="sgm_uniform">sgm_uniform</option>
-                  </select>
-                </label>
-                <label>Sampler
-                  <select name="sampler">
-                    <option value="res_multistep" selected>res_multistep（默认）</option>
-                    <option value="euler">euler</option>
-                    <option value="euler_ancestral">euler_ancestral</option>
-                    <option value="heun">heun</option>
-                    <option value="dpmpp_2m">dpmpp_2m</option>
-                    <option value="dpmpp_2m_sde">dpmpp_2m_sde</option>
-                  </select>
-                </label>
-                <label>Steps
-                  <input name="steps" type="number" min="1" max="100" step="1" value="20" required>
-                </label>
-                <label>Denoise
-                  <input name="denoise" type="number" min="0.01" max="1" step="0.01" value="1.00" required>
-                </label>
+              <div class="generation-settings-content">
+                <div class="three-col generation-media-fields">
+                  <label>画面比例
+                    <select name="aspect_ratio">
+                      <option value="auto" selected>跟随原视频</option>
+                    </select>
+                  </label>
+                  <label>视频清晰度
+                    <select name="quality">
+                      <option value="low" selected>低清 · 832×480（16:9）</option>
+                      <option value="standard">标清 · 960×544（16:9）</option>
+                      <option value="high">高清 · 1280×720（16:9）</option>
+                    </select>
+                  </label>
+                  <label>随机种子<input name="seed" type="number" min="0" placeholder="留空则自动生成"></label>
+                </div>
+                <p class="resolution-hint" id="qualityResolution">预计输出尺寸：832×480</p>
+                <div class="four-col generation-settings-fields">
+                  <label>Scheduler
+                    <select name="scheduler">
+                      <option value="simple" selected>simple（默认）</option>
+                      <option value="normal">normal</option>
+                      <option value="karras">karras</option>
+                      <option value="exponential">exponential</option>
+                      <option value="sgm_uniform">sgm_uniform</option>
+                    </select>
+                  </label>
+                  <label>Sampler
+                    <select name="sampler">
+                      <option value="uni_pc" selected>uni_pc（默认）</option>
+                      <option value="euler">euler</option>
+                      <option value="euler_ancestral">euler_ancestral</option>
+                      <option value="heun">heun</option>
+                      <option value="dpmpp_2m">dpmpp_2m</option>
+                      <option value="dpmpp_2m_sde">dpmpp_2m_sde</option>
+                    </select>
+                  </label>
+                  <label>Steps
+                    <input name="steps" type="number" min="1" max="100" step="1" value="50" required>
+                  </label>
+                  <label>Denoise
+                    <input name="denoise" type="number" min="0.01" max="1" step="0.01" value="1.00" required>
+                  </label>
+                </div>
+                <p class="sampling-hint">当前模型建议 50 Steps；低于 30 Steps 会明显影响商品替换效果。</p>
               </div>
             </details>
-            <button class="primary" type="submit">批量加入复刻队列</button>
+            <button class="primary" type="submit">批量加入精准替换队列</button>
           </form>
 
           <form id="excelForm" class="form tab-content">
@@ -145,8 +147,21 @@
 
         <div class="panel queue-panel">
           <div class="panel-title">
-            <div><h2>任务队列</h2><p>同一台服务器按顺序生成，刷新页面不会丢失。</p></div>
+            <div><h2>任务队列</h2><p id="queueSummary">最近 3 天的任务与未结束任务</p></div>
             <button class="icon-button" id="refreshButton" title="刷新">↻</button>
+          </div>
+          <div class="queue-toolbar">
+            <label class="status-filter" for="queueStatusFilter">生成状态
+              <select id="queueStatusFilter">
+                <option value="all">全部状态</option>
+                <option value="queued">排队中</option>
+                <option value="running">生成中</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+              </select>
+            </label>
+            <button type="button" class="secondary history-button" id="openHistoryButton">查看更多历史</button>
           </div>
           <div id="taskList" class="task-list">
             <div class="empty">还没有任务</div>
@@ -156,7 +171,7 @@
 
       <aside class="notice">
         <b>精准替换</b>
-        <p>商品先由 MiniMax-H3 生成候选画面，AI 根据提示词和商品参考图定位原商品，再由 SAM2 跟踪并只合成该区域；脸部最后由 FaceFusion 替换。</p>
+        <p>Florence-2 与 SAM2 自动定位并跟踪原商品，Wan VACE 只重绘商品蒙版区域；FaceFusion 只替换脸部，最后恢复原视频声音和时长。</p>
       </aside>
     </main>
   </div>
@@ -177,7 +192,37 @@
     </div>
   </dialog>
 
+  <dialog id="taskDetailDialog" class="task-detail-dialog">
+    <div class="task-detail-shell">
+      <div class="task-detail-heading">
+        <h2>任务详情</h2>
+        <button type="button" class="icon-button" id="closeTaskDetail" aria-label="关闭任务详情">×</button>
+      </div>
+      <div id="taskDetailContent"></div>
+    </div>
+  </dialog>
+
+  <dialog id="historyDialog" class="history-dialog">
+    <div class="history-shell">
+      <div class="task-detail-heading">
+        <div><h2>任务历史</h2><p id="historySummary">查看全部未删除的任务</p></div>
+        <button type="button" class="icon-button" id="closeHistoryButton" aria-label="关闭任务历史">×</button>
+      </div>
+      <label class="status-filter" for="historyStatusFilter">生成状态
+        <select id="historyStatusFilter">
+          <option value="all">全部状态</option>
+          <option value="queued">排队中</option>
+          <option value="running">生成中</option>
+          <option value="completed">已完成</option>
+          <option value="failed">失败</option>
+          <option value="cancelled">已取消</option>
+        </select>
+      </label>
+      <div id="historyTaskList" class="task-list history-task-list"></div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast hidden"></div>
-  <script src="/app.js?v=14" defer></script>
+  <script src="/app.js?v=18" defer></script>
 </body>
 </html>

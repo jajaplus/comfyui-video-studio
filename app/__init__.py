@@ -1,2 +1,1 @@
-"""MiniMax H3 Video Studio."""
-
+"""VACE precision video replacement studio."""

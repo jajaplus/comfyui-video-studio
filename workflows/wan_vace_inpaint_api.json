@@ -1,0 +1,134 @@
+{
+  "1": {
+    "class_type": "LoadVideo",
+    "inputs": {"file": "source.mp4"},
+    "_meta": {"title": "读取原视频"}
+  },
+  "2": {
+    "class_type": "GetVideoComponents",
+    "inputs": {"video": ["1", 0]},
+    "_meta": {"title": "拆分原视频画面与声音"}
+  },
+  "3": {
+    "class_type": "LoadVideo",
+    "inputs": {"file": "mask.mp4"},
+    "_meta": {"title": "读取 SAM2 商品蒙版"}
+  },
+  "4": {
+    "class_type": "GetVideoComponents",
+    "inputs": {"video": ["3", 0]},
+    "_meta": {"title": "读取商品蒙版画面"}
+  },
+  "5": {
+    "class_type": "ImageFromBatch",
+    "inputs": {"image": ["2", 0], "batch_index": 0, "length": 81},
+    "_meta": {"title": "截取原视频帧"}
+  },
+  "6": {
+    "class_type": "ImageScale",
+    "inputs": {"image": ["5", 0], "upscale_method": "lanczos", "width": 832, "height": 480, "crop": "disabled"},
+    "_meta": {"title": "缩放原视频"}
+  },
+  "7": {
+    "class_type": "ImageFromBatch",
+    "inputs": {"image": ["4", 0], "batch_index": 0, "length": 81},
+    "_meta": {"title": "截取商品蒙版帧"}
+  },
+  "8": {
+    "class_type": "ImageScale",
+    "inputs": {"image": ["7", 0], "upscale_method": "nearest-exact", "width": 832, "height": 480, "crop": "disabled"},
+    "_meta": {"title": "缩放商品蒙版"}
+  },
+  "9": {
+    "class_type": "ImageToMask",
+    "inputs": {"image": ["8", 0], "channel": "red"},
+    "_meta": {"title": "转换商品蒙版"}
+  },
+  "10": {
+    "class_type": "GrowMask",
+    "inputs": {"mask": ["9", 0], "expand": 12, "tapered_corners": true},
+    "_meta": {"title": "扩展商品蒙版边缘"}
+  },
+  "12": {
+    "class_type": "EmptyImage",
+    "inputs": {"width": 832, "height": 480, "batch_size": 81, "color": 8421504},
+    "_meta": {"title": "创建中性灰色商品重绘区域"}
+  },
+  "13": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {"destination": ["6", 0], "source": ["12", 0], "x": 0, "y": 0, "resize_source": true, "mask": ["10", 0]},
+    "_meta": {"title": "仅将待替换商品区域填为中性灰"}
+  },
+  "14": {
+    "class_type": "LoadImage",
+    "inputs": {"image": "product.png"},
+    "_meta": {"title": "读取商品参考图"}
+  },
+  "15": {
+    "class_type": "UNETLoader",
+    "inputs": {"unet_name": "wan2.1_vace_14B_fp16.safetensors", "weight_dtype": "default"},
+    "_meta": {"title": "加载 Wan2.1 VACE"}
+  },
+  "16": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {"model": ["15", 0], "shift": 16.0},
+    "_meta": {"title": "设置 VACE 采样偏移"}
+  },
+  "17": {
+    "class_type": "CLIPLoader",
+    "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"},
+    "_meta": {"title": "加载 Wan 文本编码器"}
+  },
+  "18": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {"clip": ["17", 0], "text": "Replace only the masked product with the reference product."},
+    "_meta": {"title": "精准替换提示词"}
+  },
+  "19": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {"clip": ["17", 0], "text": "worst quality, low quality, blurry, deformed, distorted product, changed person, changed face, changed body, changed clothing outside the mask, changed hands, changed background, changed camera, flicker, duplicate object, missing object, text, watermark"},
+    "_meta": {"title": "负面提示词"}
+  },
+  "20": {
+    "class_type": "VAELoader",
+    "inputs": {"vae_name": "wan_2.1_vae.safetensors"},
+    "_meta": {"title": "加载 Wan VAE"}
+  },
+  "21": {
+    "class_type": "WanVaceToVideo",
+    "inputs": {
+      "positive": ["18", 0], "negative": ["19", 0], "vae": ["20", 0],
+      "control_video": ["13", 0], "control_masks": ["10", 0], "reference_image": ["14", 0],
+      "width": 832, "height": 480, "length": 81, "batch_size": 1, "strength": 1.0
+    },
+    "_meta": {"title": "VACE 商品局部重绘"}
+  },
+  "22": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["16", 0], "positive": ["21", 0], "negative": ["21", 1], "latent_image": ["21", 2],
+      "seed": 1, "steps": 50, "cfg": 5.0, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1.0
+    },
+    "_meta": {"title": "仅采样商品蒙版区域"}
+  },
+  "23": {
+    "class_type": "TrimVideoLatent",
+    "inputs": {"samples": ["22", 0], "trim_amount": ["21", 3]},
+    "_meta": {"title": "裁剪 VACE 潜空间"}
+  },
+  "24": {
+    "class_type": "VAEDecode",
+    "inputs": {"samples": ["23", 0], "vae": ["20", 0]},
+    "_meta": {"title": "解码精准替换画面"}
+  },
+  "25": {
+    "class_type": "CreateVideo",
+    "inputs": {"images": ["24", 0], "audio": ["2", 1], "fps": 16.0},
+    "_meta": {"title": "合成替换视频"}
+  },
+  "26": {
+    "class_type": "SaveVideo",
+    "inputs": {"video": ["25", 0], "filename_prefix": "video/vace_precision", "format": "auto", "codec": "auto"},
+    "_meta": {"title": "保存精准替换视频"}
+  }
+}

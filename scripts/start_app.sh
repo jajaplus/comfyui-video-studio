@@ -10,6 +10,12 @@ if [[ -f .env ]]; then
   set +a
 fi
 
+TOOLS_DIR="${H3_PRECISION_TOOLS_DIR:-/root/autodl-tmp/h3-precision-tools}"
+FFMPEG_ENV="${H3_FFMPEG_ENV:-$TOOLS_DIR/ffmpeg-env}"
+if [[ -x "$FFMPEG_ENV/bin/ffmpeg" ]]; then
+  export PATH="$FFMPEG_ENV/bin:$PATH"
+fi
+
 export H3_STUDIO_DATA_DIR="${H3_STUDIO_DATA_DIR:-/root/autodl-tmp/h3-studio-data}"
 export H3_COMFYUI_URL="${H3_COMFYUI_URL:-http://127.0.0.1:6008}"
 exec .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 6006 --workers 1

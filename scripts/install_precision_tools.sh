@@ -38,6 +38,7 @@ HF_ENDPOINT_URL="${H3_HF_ENDPOINT:-https://hf-mirror.com}"
 HF_DOWNLOAD_TIMEOUT="${H3_HF_DOWNLOAD_TIMEOUT:-60}"
 
 mkdir -p "$TOOLS_DIR"
+scripts/install_ffmpeg.sh
 
 COMFY_DIR="${H3_COMFYUI_DIR:-/root/ComfyUI}"
 if [[ -n "${H3_COMFYUI_PYTHON:-}" && -x "${H3_COMFYUI_PYTHON}" ]]; then

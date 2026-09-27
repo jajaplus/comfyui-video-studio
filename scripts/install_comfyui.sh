@@ -71,6 +71,11 @@ if [[ ! -d "$COMFY_DIR/.git" ]]; then
   git clone --depth 1 https://github.com/Comfy-Org/ComfyUI.git "$COMFY_DIR"
 else
   echo "已找到 ComfyUI：$COMFY_DIR，保留当前版本。"
+  if ! grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
+    "WanVaceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
+    echo "独立 ComfyUI 缺少 VACE 节点，正在更新这个数据盘副本。"
+    git -C "$COMFY_DIR" pull --ff-only
+  fi
 fi
 
 if [[ ! -x "$COMFY_DIR/.venv/bin/python" ]]; then
@@ -117,8 +122,8 @@ else:
 PY
 
 if ! grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
-  "MiniMaxH3ReferenceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
-  echo "安装到 $COMFY_DIR 的独立 ComfyUI 中未找到 MiniMax-H3 原生节点，请检查源码是否完整后重新运行本脚本。" >&2
+  "WanVaceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
+  echo "安装到 $COMFY_DIR 的 ComfyUI 中未找到 WanVaceToVideo，请检查源码版本是否支持 VACE。" >&2
   exit 1
 fi
 

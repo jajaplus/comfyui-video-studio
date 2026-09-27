@@ -19,7 +19,7 @@ REQUIRED_MODELS = {
     "models-3.3.0": ["nsfw_1", "nsfw_2", "nsfw_3"],
     "models-3.1.0": ["xseg_1"],
     "models-3.0.0": [
-        "fairface", "yoloface_8n", "2dfan4", "fan_68_5",
+        "fairface", "yoloface_8n", "retinaface_10g", "2dfan4", "fan_68_5",
         "bisenet_resnet_34", "arcface_w600k_r50", "kim_vocal_2",
         "inswapper_128_fp16",
     ],

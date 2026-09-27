@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import mimetypes
 import os
 import re
 import secrets
@@ -16,12 +17,13 @@ import urllib.request
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode, urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
@@ -48,18 +50,21 @@ COMFYUI_DIR = Path(os.getenv("H3_COMFYUI_DIR", "/root/autodl-tmp/ComfyUI")).reso
 COMFYUI_INPUT_DIR = Path(os.getenv("H3_COMFYUI_INPUT_DIR", COMFYUI_DIR / "input")).resolve()
 COMFYUI_OUTPUT_DIR = Path(os.getenv("H3_COMFYUI_OUTPUT_DIR", COMFYUI_DIR / "output")).resolve()
 COMFYUI_WORKFLOW = Path(
-    os.getenv("H3_COMFYUI_WORKFLOW", ROOT / "workflows" / "minimax_h3_ref2va_api.json")
+    os.getenv("VACE_COMFYUI_WORKFLOW", ROOT / "workflows" / "wan_vace_inpaint_api.json")
 ).resolve()
 COMFYUI_TIMEOUT = max(300, int(os.getenv("H3_COMFYUI_TIMEOUT", "10800")))
 PRECISION_TOOLS_DIR = Path(
     os.getenv("H3_PRECISION_TOOLS_DIR", "/root/autodl-tmp/h3-precision-tools")
+).resolve()
+FFMPEG_ENV = Path(
+    os.getenv("H3_FFMPEG_ENV", PRECISION_TOOLS_DIR / "ffmpeg-env")
 ).resolve()
 SAM2_PYTHON = Path(
     os.getenv("H3_SAM2_PYTHON", PRECISION_TOOLS_DIR / "sam2-env" / "bin" / "python")
 )
 SAM2_PYTHON = absolute_path_without_resolving(SAM2_PYTHON)
 SAM2_SCRIPT = Path(
-    os.getenv("H3_SAM2_SCRIPT", ROOT / "scripts" / "sam2_product_composite.py")
+    os.getenv("H3_SAM2_SCRIPT", ROOT / "scripts" / "sam2_product_mask.py")
 ).resolve()
 SAM2_MODEL_ID = os.getenv("H3_SAM2_MODEL_ID", "facebook/sam2.1-hiera-small")
 SAM2_CHECKPOINT = Path(
@@ -80,34 +85,47 @@ FACEFUSION_PYTHON = Path(
     os.getenv("H3_FACEFUSION_PYTHON", PRECISION_TOOLS_DIR / "facefusion-env" / "bin" / "python")
 )
 FACEFUSION_PYTHON = absolute_path_without_resolving(FACEFUSION_PYTHON)
-COMFYUI_UNET = os.getenv(
-    "H3_COMFYUI_UNET", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+FACEFUSION_DETECTOR_SCORE = min(
+    1.0, max(0.0, float(os.getenv("H3_FACEFUSION_DETECTOR_SCORE", "0.25")))
 )
-COMFYUI_CLIP = os.getenv(
-    "H3_COMFYUI_CLIP", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+FACEFUSION_LANDMARKER_SCORE = min(
+    1.0, max(0.0, float(os.getenv("H3_FACEFUSION_LANDMARKER_SCORE", "0.25")))
 )
-COMFYUI_VIDEO_VAE = os.getenv(
-    "H3_COMFYUI_VIDEO_VAE", "minimax_h3_video_vae_int8_convrot.safetensors"
+FACEFUSION_SWAPPER_WEIGHT = min(
+    1.0, max(0.0, float(os.getenv("H3_FACEFUSION_SWAPPER_WEIGHT", "0.85")))
 )
-COMFYUI_AUDIO_VAE = os.getenv("H3_COMFYUI_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
+FACEFUSION_LOG_DIR = Path(
+    os.getenv("H3_FACEFUSION_LOG_DIR", ROOT / "logs" / "facefusion")
+).resolve()
+VACE_UNET = os.getenv("VACE_UNET", "wan2.1_vace_14B_fp16.safetensors")
+VACE_CLIP = os.getenv("VACE_CLIP", "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
+VACE_VAE = os.getenv("VACE_VAE", "wan_2.1_vae.safetensors")
+VACE_FPS = 16
+VACE_MASK_EXPAND = max(0, int(os.getenv("VACE_MASK_EXPAND", "12")))
+VACE_CFG = max(0.1, float(os.getenv("VACE_CFG", "5")))
 POLL_SECONDS = max(1.0, float(os.getenv("H3_POLL_SECONDS", "3")))
 MAX_UPLOAD_GB = max(1, int(os.getenv("H3_MAX_UPLOAD_GB", "20")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_GB * 1024**3
-MAX_SEGMENT_SECONDS = 15.0
-MIN_VIDEO_SECONDS = 4.0
+MAX_SEGMENT_SECONDS = 5.0
+MIN_VIDEO_SECONDS = 1.0
 QUALITY_LEVELS = {"low", "standard", "high"}
-SAMPLER_NAMES = {
-    "res_multistep", "euler", "euler_ancestral", "heun",
-    "dpmpp_2m", "dpmpp_2m_sde",
-}
+SAMPLER_NAMES = {"uni_pc", "euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde"}
 SCHEDULER_NAMES = {"simple", "normal", "karras", "exponential", "sgm_uniform"}
-DEFAULT_SAMPLER = "res_multistep"
+DEFAULT_SAMPLER = "uni_pc"
 DEFAULT_SCHEDULER = "simple"
-DEFAULT_STEPS = 20
+DEFAULT_STEPS = 50
 DEFAULT_DENOISE = 1.0
 
 
 class BlackVideoError(RuntimeError):
+    pass
+
+
+class FaceSwapError(RuntimeError):
+    pass
+
+
+class ProductMaskError(RuntimeError):
     pass
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
@@ -178,9 +196,9 @@ def init_db() -> None:
                 reference_roles TEXT,
                 product_box TEXT,
                 precision_mode INTEGER NOT NULL DEFAULT 1,
-                sampler TEXT NOT NULL DEFAULT 'res_multistep',
+                sampler TEXT NOT NULL DEFAULT 'uni_pc',
                 scheduler TEXT NOT NULL DEFAULT 'simple',
-                steps INTEGER NOT NULL DEFAULT 20,
+                steps INTEGER NOT NULL DEFAULT 50,
                 denoise REAL NOT NULL DEFAULT 1.0
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_queue
@@ -210,13 +228,22 @@ def init_db() -> None:
         if "precision_mode" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN precision_mode INTEGER NOT NULL DEFAULT 0")
         if "sampler" not in columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN sampler TEXT NOT NULL DEFAULT 'res_multistep'")
+            conn.execute("ALTER TABLE tasks ADD COLUMN sampler TEXT NOT NULL DEFAULT 'uni_pc'")
         if "scheduler" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN scheduler TEXT NOT NULL DEFAULT 'simple'")
         if "steps" not in columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN steps INTEGER NOT NULL DEFAULT 20")
+            conn.execute("ALTER TABLE tasks ADD COLUMN steps INTEGER NOT NULL DEFAULT 50")
         if "denoise" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN denoise REAL NOT NULL DEFAULT 1.0")
+        conn.execute(
+            "UPDATE tasks SET precision_mode=1, aspect_ratio='auto' "
+            "WHERE status='queued' AND deleted_at IS NULL"
+        )
+        conn.execute(
+            "UPDATE tasks SET sampler=? WHERE status='queued' AND deleted_at IS NULL "
+            "AND sampler NOT IN ('uni_pc','euler','euler_ancestral','heun','dpmpp_2m','dpmpp_2m_sde')",
+            (DEFAULT_SAMPLER,),
+        )
         conn.execute(
             "UPDATE tasks SET status='queued', progress=0, stage='等待队列', started_at=NULL, "
             "updated_at=? WHERE status IN ('starting','running') AND deleted_at IS NULL",
@@ -232,13 +259,13 @@ def validate_extension(filename: str, allowed: set[str], label: str) -> None:
 
 
 def segment_durations(duration: float) -> list[float]:
-    """Split a source duration into nearly equal H3-compatible 4–15 second parts."""
+    """Split a source into nearly equal VACE-friendly clips no longer than five seconds."""
     if not math.isfinite(duration) or duration < MIN_VIDEO_SECONDS:
         raise ValueError(f"上传视频时长为 {duration:.2f} 秒；视频不能短于 {MIN_VIDEO_SECONDS:g} 秒")
     count = max(1, math.ceil(duration / MAX_SEGMENT_SECONDS))
     segment = duration / count
     if segment < MIN_VIDEO_SECONDS:
-        raise ValueError("无法把视频切分为符合 MiniMax-H3 要求的片段")
+        raise ValueError("无法把视频切分为符合 VACE 要求的片段")
     parts = [round(segment, 3) for _ in range(count)]
     parts[-1] = round(duration - sum(parts[:-1]), 3)
     return parts
@@ -250,16 +277,16 @@ def validate_task_values(
     steps: int = DEFAULT_STEPS, denoise: float = DEFAULT_DENOISE,
 ) -> None:
     segment_durations(duration)
-    if aspect_ratio not in {"auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}:
-        raise ValueError("不支持的画面比例")
+    if aspect_ratio != "auto":
+        raise ValueError("精准替换固定跟随原视频比例，aspect_ratio 必须是 auto")
     if quality not in QUALITY_LEVELS:
         raise ValueError("不支持的视频清晰度")
     if sampler not in SAMPLER_NAMES:
         raise ValueError("不支持的 Sampler")
     if scheduler not in SCHEDULER_NAMES:
         raise ValueError("不支持的 Scheduler")
-    if not 1 <= int(steps) <= 100:
-        raise ValueError("Steps 必须在 1–100 之间")
+    if not 30 <= int(steps) <= 100:
+        raise ValueError("当前 VACE 模型需要 30–100 Steps，建议使用默认的 50 Steps")
     if not math.isfinite(float(denoise)) or not 0.01 <= float(denoise) <= 1:
         raise ValueError("Denoise 必须在 0.01–1.00 之间")
 
@@ -305,7 +332,7 @@ def probe_video_duration(source: str | Path, hint: float | None = None) -> float
     if duration is None:
         raise ValueError(f"无法读取视频“{media_display_name(source)}”的时长，请确认 URL 可公开访问或视频可正常播放")
     duration = round(duration, 3)
-    validate_task_values(duration, "16:9")
+    validate_task_values(duration, "auto")
     return duration
 
 
@@ -340,6 +367,11 @@ def task_to_dict(row: sqlite3.Row, queue_position: int | None = None) -> dict[st
         if result.get(field):
             result[field] = media_display_name(result[field])
     result["reference_images"] = [media_display_name(path) for path in row_reference_paths(row)]
+    result["source_media_url"] = f"/api/tasks/{row['id']}/media/source/0"
+    result["reference_media_urls"] = [
+        f"/api/tasks/{row['id']}/media/reference/{index}"
+        for index, _ in enumerate(result["reference_images"])
+    ]
     result["reference_roles"] = row_reference_roles(row)
     if result.get("product_box"):
         try:
@@ -371,15 +403,17 @@ def insert_task(
         source_path = Path(source_text)
         if not source_path.is_file() or source_path.suffix.lower() not in VIDEO_EXTENSIONS:
             raise ValueError("upload_video 必须是已上传的受支持视频文件")
-    if len(reference_images) > 9:
-        raise ValueError("参考图片最多上传 9 张")
+    if not reference_images:
+        raise ValueError("请至少提供一张脸部参考图或商品参考图")
+    if len(reference_images) > 2:
+        raise ValueError("精准替换最多上传 2 张参考图：1 张脸部图和 1 张商品图")
     roles = list(reference_roles or [])
-    if roles and len(roles) != len(reference_images):
+    if len(roles) != len(reference_images):
         raise ValueError("参考图片角色数量与图片数量不一致")
-    if not roles:
-        roles = ["auto"] * len(reference_images)
-    if any(role not in {"face", "product", "auto"} for role in roles):
-        raise ValueError("参考图片角色必须是 face、product 或 auto")
+    if any(role not in {"face", "product"} for role in roles):
+        raise ValueError("参考图片角色必须是 face 或 product")
+    if roles.count("face") > 1 or roles.count("product") > 1:
+        raise ValueError("脸部参考图和商品参考图各最多 1 张")
     if product_box is not None:
         if len(product_box) != 4 or any(not math.isfinite(float(value)) for value in product_box):
             raise ValueError("商品框格式不正确")
@@ -399,7 +433,7 @@ def insert_task(
     now = utcnow()
     actual_seed = seed if seed is not None else secrets.randbelow(2_147_483_647)
     name = Path(display_name or media_display_name(source_video)).stem
-    part_count = len(segment_durations(duration))
+    part_count = len(segment_durations(duration)) if "product" in roles else 1
     with connect_db() as conn:
         conn.execute(
             """INSERT INTO tasks (
@@ -460,38 +494,18 @@ def row_reference_paths(
     return legacy
 
 
-def build_h3_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
-    definitions = [
-        "<Video 1> is the authoritative source video and the ground truth for every frame. "
-        "Keep its exact shot order, people, body motion, timing, framing, camera motion, lighting, background, and soundtrack."
-    ]
-    reference_paths = row_reference_paths(row)
-    for picture_index, _ in enumerate(reference_paths, start=1):
-        definitions.append(
-            f"<Picture {picture_index}> is an appearance reference only. Use the user's mapping to decide whether it supplies "
-            "a face identity or a product appearance. Never copy its pose, body, clothing, background, camera, or composition."
-        )
-    user_request = row["prompt"].strip() or (
-        "Infer which supplied pictures show a face/person and which show a product. "
-        "Use face/person pictures only for facial identity, and product pictures only for the existing product."
-    )
+def build_vace_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
+    user_request = str(row["prompt"] or "").strip()
+    if not user_request:
+        user_request = "将蒙版中的原商品替换为参考图里的商品。"
     return (
-        "subject_definitions:\n" + "\n".join(definitions) +
-        "\n\nedit_scope:\n"
-        "Perform a localized face-and-product edit of <Video 1>, not a person replacement and not a scene recreation. "
-        "For a face reference, change only the visible facial identity and facial appearance inside the original face region. "
-        "Keep the original person's hair, head position, body, skin outside the face, clothing, pose, gestures, gaze direction, "
-        "scale, location, motion, and visibility. For a product reference, replace only the pixels belonging to the original product. "
-        "Keep the product in the exact original location and preserve its size, orientation, motion, perspective, hand contact, "
-        "occlusion, reflections, and shadows. When the original face or product is occluded or outside the frame, keep it occluded or absent."
-        "\n\nhard_constraints:\n"
-        "Every person visible in <Video 1> must remain visible in exactly the same frames. The main model must never disappear, "
-        "be replaced by an empty background, become a different full body, or change clothes. Never add or remove a person, limb, "
-        "product, shot, cut, logo, text, or camera move. Preserve the background, lighting, timing, motion, framing, and synchronized audio. "
-        "If any replacement is uncertain, preserve the original source pixels and subject presence instead of inventing content."
-        "\n\nuser_mapping_and_request:\n" + user_request +
-        "\n\nfinal_priority:\nSource-video structure and subject presence have higher priority than reference-image appearance. "
-        "The only permitted visual changes are the requested face identity and existing product appearance."
+        "当前步骤只执行商品或服装替换，忽略提示词中的换脸和人物身份要求。\n"
+        f"用户要求：{user_request}\n"
+        "只修改蒙版覆盖的原商品区域，并使用参考图中商品的外观、材质、颜色和细节。"
+        "严格保持原视频中的人物身份、脸、头发、身体、动作、手部遮挡、姿态、服装中未被蒙版覆盖的区域、"
+        "背景、灯光、镜头、构图和时间顺序。商品必须保持原商品的位置、大小、朝向、透视、运动轨迹、"
+        "手部接触、遮挡关系、反射和阴影。不要新增或删除人物、肢体、物体、文字、镜头或背景内容。"
+        "蒙版外像素必须保持为原视频。"
     )
 
 
@@ -582,12 +596,12 @@ def comfy_node_stage(workflow: dict[str, Any], node_id: Any) -> tuple[str, int]:
         return "读取参考素材", 18
     if class_type in {"UNETLoader", "CLIPLoader", "VAELoader"}:
         return f"加载模型：{title}", 22
-    if class_type == "MiniMaxH3ReferenceToVideo":
-        return "编码视频、图片与提示词", 30
-    if class_type in {"BasicScheduler", "BasicGuider", "KSamplerSelect", "RandomNoise"}:
+    if class_type == "WanVaceToVideo":
+        return "编码原视频、商品蒙版与参考图", 30
+    if class_type in {"BasicScheduler", "BasicGuider", "KSamplerSelect", "RandomNoise", "ModelSamplingSD3"}:
         return "准备采样参数", 34
-    if class_type == "SamplerCustomAdvanced":
-        return "采样生成视频", 36
+    if class_type in {"SamplerCustomAdvanced", "KSampler"}:
+        return "VACE 仅重绘商品区域", 36
     if class_type == "VAEDecode":
         return "解码视频画面", 90
     if class_type == "VAEDecodeAudio":
@@ -687,8 +701,10 @@ def copy_media_to_comfy(source: str | Path, destination: Path) -> None:
         raise
 
 
-def prepare_comfy_inputs(row: sqlite3.Row) -> tuple[str, list[str], Path]:
-    task_folder = COMFYUI_INPUT_DIR / "h3_studio" / row["id"]
+def prepare_vace_inputs(
+    row: sqlite3.Row | dict[str, Any], mask_source: Path, product_reference: Path,
+) -> tuple[str, str, str, Path]:
+    task_folder = COMFYUI_INPUT_DIR / "vace_precision" / str(row["id"])
     task_folder.mkdir(parents=True, exist_ok=True)
     try:
         source_suffix = Path(urlparse(str(row["source_video"])).path).suffix.lower() or ".mp4"
@@ -696,16 +712,19 @@ def prepare_comfy_inputs(row: sqlite3.Row) -> tuple[str, list[str], Path]:
             source_suffix = ".mp4"
         source_path = task_folder / f"source{source_suffix}"
         copy_media_to_comfy(row["source_video"], source_path)
-
-        reference_names: list[str] = []
-        for index, source in enumerate(row_reference_paths(row), start=1):
-            suffix = Path(urlparse(str(source)).path).suffix.lower() or ".jpg"
-            if suffix not in IMAGE_EXTENSIONS:
-                suffix = ".jpg"
-            destination = task_folder / f"reference_{index:02d}{suffix}"
-            copy_media_to_comfy(source, destination)
-            reference_names.append(destination.relative_to(COMFYUI_INPUT_DIR).as_posix())
-        return source_path.relative_to(COMFYUI_INPUT_DIR).as_posix(), reference_names, task_folder
+        mask_path = task_folder / "product_mask.mp4"
+        copy_media_to_comfy(mask_source, mask_path)
+        reference_suffix = product_reference.suffix.lower()
+        if reference_suffix not in IMAGE_EXTENSIONS:
+            reference_suffix = ".jpg"
+        reference_path = task_folder / f"product_reference{reference_suffix}"
+        copy_media_to_comfy(product_reference, reference_path)
+        return (
+            source_path.relative_to(COMFYUI_INPUT_DIR).as_posix(),
+            mask_path.relative_to(COMFYUI_INPUT_DIR).as_posix(),
+            reference_path.relative_to(COMFYUI_INPUT_DIR).as_posix(),
+            task_folder,
+        )
     except Exception:
         shutil.rmtree(task_folder, ignore_errors=True)
         raise
@@ -713,28 +732,28 @@ def prepare_comfy_inputs(row: sqlite3.Row) -> tuple[str, list[str], Path]:
 
 QUALITY_DIMENSIONS = {
     "low": {
-        "16:9": (672, 384),
-        "9:16": (384, 672),
-        "1:1": (512, 512),
-        "4:3": (576, 448),
-        "3:4": (448, 576),
-        "21:9": (768, 320),
-    },
-    "standard": {
         "16:9": (832, 480),
         "9:16": (480, 832),
-        "1:1": (640, 640),
-        "4:3": (736, 544),
-        "3:4": (544, 736),
-        "21:9": (960, 416),
+        "1:1": (480, 480),
+        "4:3": (640, 480),
+        "3:4": (480, 640),
+        "21:9": (1104, 480),
+    },
+    "standard": {
+        "16:9": (960, 544),
+        "9:16": (544, 960),
+        "1:1": (544, 544),
+        "4:3": (720, 544),
+        "3:4": (544, 720),
+        "21:9": (1248, 544),
     },
     "high": {
-        "16:9": (1344, 768),
-        "9:16": (768, 1344),
-        "1:1": (1024, 1024),
-        "4:3": (1024, 768),
-        "3:4": (768, 1024),
-        "21:9": (1568, 672),
+        "16:9": (1280, 720),
+        "9:16": (720, 1280),
+        "1:1": (720, 720),
+        "4:3": (960, 720),
+        "3:4": (720, 960),
+        "21:9": (1680, 720),
     },
 }
 
@@ -771,6 +790,28 @@ def probe_video_dimensions(source: str | Path) -> tuple[int, int] | None:
         return None
 
 
+def vace_output_dimensions(source: str | Path, quality: str) -> tuple[int, int]:
+    source_size = probe_video_dimensions(source)
+    if not source_size:
+        return QUALITY_DIMENSIONS[quality]["16:9"]
+    source_width, source_height = source_size
+    short_edge = {"low": 480, "standard": 544, "high": 720}[quality]
+    long_edge_cap = {"low": 1104, "standard": 1248, "high": 1680}[quality]
+    if source_width >= source_height:
+        height = short_edge
+        width = max(64, round((short_edge * source_width / source_height) / 16) * 16)
+        if width > long_edge_cap:
+            width = (long_edge_cap // 16) * 16
+            height = max(64, round((width * source_height / source_width) / 16) * 16)
+    else:
+        width = short_edge
+        height = max(64, round((short_edge * source_height / source_width) / 16) * 16)
+        if height > long_edge_cap:
+            height = (long_edge_cap // 16) * 16
+            width = max(64, round((height * source_width / source_height) / 16) * 16)
+    return width, height
+
+
 def signalstats_indicates_black(output: str) -> bool:
     averages = [float(value) for value in re.findall(r"lavfi\.signalstats\.YAVG=([0-9.]+)", output)]
     maximums = [float(value) for value in re.findall(r"lavfi\.signalstats\.YMAX=([0-9.]+)", output)]
@@ -805,65 +846,52 @@ def ensure_visible_video(source: Path, stage: str) -> None:
         raise BlackVideoError(f"{stage}检测为全黑画面")
 
 
-def next_workflow_node_id(workflow: dict[str, Any]) -> str:
-    return str(max(int(node_id) for node_id in workflow) + 1)
+def vace_frame_count(duration: float) -> int:
+    """Wan video lengths use 4n+1 frames; 81 frames is about five seconds at 16 fps."""
+    return max(5, int(math.floor(float(duration) * VACE_FPS / 4)) * 4 + 1)
 
 
-def build_comfy_workflow(row: sqlite3.Row, source_upload: str, reference_uploads: list[str]) -> dict[str, Any]:
+def build_comfy_workflow(
+    row: sqlite3.Row | dict[str, Any], source_upload: str, mask_upload: str,
+    product_reference_upload: str,
+) -> dict[str, Any]:
     if not COMFYUI_WORKFLOW.is_file():
         raise RuntimeError(f"找不到 ComfyUI 工作流：{COMFYUI_WORKFLOW}")
     workflow = json.loads(COMFYUI_WORKFLOW.read_text(encoding="utf-8"))
-    sampler = workflow["136"]["inputs"]
     local_source = COMFYUI_INPUT_DIR / source_upload
-    ratio = row["aspect_ratio"] if row["aspect_ratio"] != "auto" else source_aspect_ratio(local_source)
     quality = str(row.get("quality") or "low") if isinstance(row, dict) else str(row["quality"] or "low")
     if quality not in QUALITY_LEVELS:
         quality = "low"
-    width, height = QUALITY_DIMENSIONS[quality][ratio]
-    sampler["width"] = width
-    sampler["height"] = height
-    workflow["132"]["inputs"]["value"] = float(row["duration"])
-    workflow["129"]["inputs"]["noise_seed"] = int(row["seed"])
-    workflow["123"]["inputs"]["sampler_name"] = str(row["sampler"] or DEFAULT_SAMPLER)
-    workflow["124"]["inputs"]["scheduler"] = str(row["scheduler"] or DEFAULT_SCHEDULER)
-    workflow["124"]["inputs"]["steps"] = int(row["steps"] or DEFAULT_STEPS)
-    workflow["124"]["inputs"]["denoise"] = float(
-        row["denoise"] if row["denoise"] is not None else DEFAULT_DENOISE
-    )
-    workflow["138"]["inputs"]["value"] = build_h3_prompt(row)
-    workflow["92"]["inputs"]["filename_prefix"] = f"h3_studio/{row['id']}"
-    workflow["127"]["inputs"]["unet_name"] = COMFYUI_UNET
-    workflow["128"]["inputs"]["clip_name"] = COMFYUI_CLIP
-    workflow["119"]["inputs"]["vae_name"] = COMFYUI_VIDEO_VAE
-    workflow["120"]["inputs"]["vae_name"] = COMFYUI_AUDIO_VAE
+    width, height = vace_output_dimensions(local_source, quality)
+    frames = vace_frame_count(float(row["duration"]))
 
-    for key in list(sampler):
-        if key.startswith(("ref_images.ref_image_", "ref_videos.ref_video_", "ref_video_audios.ref_video_audio_")):
-            del sampler[key]
-    for node_id in list(workflow):
-        if workflow[node_id]["class_type"] in {"LoadImage", "LoadVideo", "GetVideoComponents"}:
-            del workflow[node_id]
-
-    load_video_id = next_workflow_node_id(workflow)
-    workflow[load_video_id] = {
-        "class_type": "LoadVideo", "inputs": {"file": source_upload},
-        "_meta": {"title": "上传视频"},
-    }
-    components_id = next_workflow_node_id(workflow)
-    workflow[components_id] = {
-        "class_type": "GetVideoComponents", "inputs": {"video": [load_video_id, 0]},
-        "_meta": {"title": "读取视频画面与声音"},
-    }
-    sampler["ref_videos.ref_video_0"] = [components_id, 0]
-    sampler["ref_video_audios.ref_video_audio_0"] = [components_id, 1]
-
-    for index, uploaded_name in enumerate(reference_uploads[:9]):
-        node_id = next_workflow_node_id(workflow)
-        workflow[node_id] = {
-            "class_type": "LoadImage", "inputs": {"image": uploaded_name},
-            "_meta": {"title": f"参考图片 {index + 1}"},
-        }
-        sampler[f"ref_images.ref_image_{index}"] = [node_id, 0]
+    workflow["1"]["inputs"]["file"] = source_upload
+    workflow["3"]["inputs"]["file"] = mask_upload
+    workflow["5"]["inputs"]["length"] = frames
+    workflow["6"]["inputs"].update({"width": width, "height": height})
+    workflow["7"]["inputs"]["length"] = frames
+    workflow["8"]["inputs"].update({"width": width, "height": height})
+    workflow["10"]["inputs"]["expand"] = VACE_MASK_EXPAND
+    workflow["12"]["inputs"].update({"width": width, "height": height, "batch_size": frames})
+    workflow["14"]["inputs"]["image"] = product_reference_upload
+    workflow["15"]["inputs"]["unet_name"] = VACE_UNET
+    workflow["17"]["inputs"]["clip_name"] = VACE_CLIP
+    workflow["18"]["inputs"]["text"] = build_vace_prompt(row)
+    workflow["20"]["inputs"]["vae_name"] = VACE_VAE
+    workflow["16"]["inputs"]["shift"] = 16.0
+    workflow["21"]["inputs"].update({"width": width, "height": height, "length": frames})
+    workflow["22"]["inputs"].update({
+        "seed": int(row["seed"]),
+        "steps": int(row["steps"] or DEFAULT_STEPS),
+        "cfg": VACE_CFG,
+        "sampler_name": str(row["sampler"] or DEFAULT_SAMPLER),
+        "scheduler": str(row["scheduler"] or DEFAULT_SCHEDULER),
+        "denoise": float(
+            row["denoise"] if row["denoise"] is not None else DEFAULT_DENOISE
+        ),
+    })
+    workflow["25"]["inputs"]["fps"] = float(VACE_FPS)
+    workflow["26"]["inputs"]["filename_prefix"] = f"vace_precision/{row['id']}"
     return workflow
 
 
@@ -880,16 +908,30 @@ def try_cancel_comfy(prompt_id: str | None) -> None:
         pass
 
 
+def ensure_vace_node_available() -> None:
+    try:
+        info = http_json("GET", f"{COMFYUI_URL}/object_info/WanVaceToVideo", timeout=15)
+    except Exception as exc:
+        raise RuntimeError(
+            "当前 ComfyUI 无法读取 WanVaceToVideo 节点，请确认已启动支持 VACE 的新版 ComfyUI"
+        ) from exc
+    if "WanVaceToVideo" not in info:
+        raise RuntimeError(
+            "当前 ComfyUI 缺少 WanVaceToVideo 节点，请按 README 第 3.2 节安装支持 VACE 的版本"
+        )
+
+
 def comfy_history_output(record: dict[str, Any]) -> dict[str, str]:
     status = record.get("status") or {}
     if status.get("status_str") == "error":
         messages = [item[1] for item in status.get("messages", []) if item and item[0] == "execution_error"]
         raise RuntimeError(f"ComfyUI 生成失败：{messages[-1] if messages else status}")
-    node_output = (record.get("outputs") or {}).get("92") or {}
-    for field in ("images", "videos", "gifs"):
-        entries = node_output.get(field) or []
-        if entries:
-            return entries[0]
+    outputs = record.get("outputs") or {}
+    for node_output in outputs.values():
+        for field in ("videos", "images", "gifs"):
+            entries = node_output.get(field) or []
+            if entries and Path(str(entries[0].get("filename", ""))).suffix.lower() in VIDEO_EXTENSIONS:
+                return entries[0]
     raise RuntimeError("ComfyUI 已结束，但没有返回 SaveVideo 输出")
 
 
@@ -934,7 +976,7 @@ def run_ffmpeg(arguments: list[str], purpose: str) -> None:
 
 def run_external_command(
     command: list[str], purpose: str, cwd: Path | None = None,
-    log_path: Path | None = None,
+    log_path: Path | None = None, environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
@@ -943,6 +985,7 @@ def run_external_command(
             capture_output=True,
             text=True,
             timeout=COMFYUI_TIMEOUT,
+            env=environment,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"{purpose}所需程序不存在：{command[0]}") from exc
@@ -955,7 +998,14 @@ def run_external_command(
             encoding="utf-8",
         )
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "未知错误").strip()[-4000:]
+        raw_detail = completed.stderr or completed.stdout or "未知错误"
+        log_lines = [line.strip() for line in re.split(r"[\r\n]+", raw_detail)]
+        relevant_lines = [
+            line for line in log_lines if line and not re.match(
+                r"^(?:analysing|processing|extracting|merging):\s*\d+%", line
+            )
+        ]
+        detail = "\n".join(relevant_lines[-20:])[-3000:] or raw_detail.strip()[-3000:]
         raise RuntimeError(f"{purpose}失败：{detail}")
     return completed
 
@@ -984,10 +1034,9 @@ def unload_comfy_models() -> None:
         pass
 
 
-def run_product_mask_composite(
-    source: Path, candidate: Path, product_box: list[float] | None,
-    product_reference: Path, target_description: str, destination: Path,
-    work_folder: Path,
+def run_product_mask_tracking(
+    source: Path, product_box: list[float] | None, product_reference: Path,
+    target_description: str, destination: Path, work_folder: Path,
 ) -> None:
     if not SAM2_PYTHON.is_file() or not SAM2_SCRIPT.is_file():
         raise RuntimeError("SAM2 精准商品工具未安装，请运行 scripts/install_precision_tools.sh")
@@ -995,24 +1044,27 @@ def run_product_mask_composite(
     command = [
             str(SAM2_PYTHON), str(SAM2_SCRIPT),
             "--source", str(source),
-            "--candidate", str(candidate),
             "--output", str(destination),
             "--product-reference", str(product_reference),
             "--target-description", target_description,
             "--florence-model", FLORENCE2_MODEL,
             "--model-id", SAM2_MODEL_ID,
+            "--fps", str(VACE_FPS),
             "--work-dir", str(work_folder / "sam2"),
         ]
     if product_box is not None:
         command.extend(["--box", json.dumps(product_box)])
     if SAM2_CHECKPOINT.is_file():
         command.extend(["--checkpoint", str(SAM2_CHECKPOINT), "--model-config", SAM2_CONFIG])
-    run_external_command(
-        command,
-        "SAM2 商品跟踪与蒙版合成",
-    )
+    try:
+        run_external_command(
+            command,
+            "Florence-2 与 SAM2 商品定位跟踪",
+        )
+    except RuntimeError as exc:
+        raise ProductMaskError(str(exc)) from exc
     if not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError("SAM2 商品合成没有生成视频")
+        raise RuntimeError("SAM2 没有生成商品蒙版视频")
 
 
 def materialize_reference_images(
@@ -1029,30 +1081,147 @@ def materialize_reference_images(
     return results
 
 
+@lru_cache(maxsize=1)
+def facefusion_ffmpeg_environment() -> dict[str, str]:
+    ffmpeg_path = FFMPEG_ENV / "bin" / "ffmpeg"
+    ffprobe_path = FFMPEG_ENV / "bin" / "ffprobe"
+    if not os.access(ffmpeg_path, os.X_OK) or not os.access(ffprobe_path, os.X_OK):
+        raise FaceSwapError("FaceFusion 需要新版 FFmpeg，请先运行 scripts/install_ffmpeg.sh")
+    try:
+        help_result = subprocess.run(
+            [str(ffmpeg_path), "-hide_banner", "-h", "full"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FaceSwapError("无法检查 FFmpeg 的 FaceFusion 兼容性") from exc
+    if help_result.returncode != 0 or "-fps_mode" not in \
+            f"{help_result.stdout}\n{help_result.stderr}":
+        raise FaceSwapError("当前 FFmpeg 不支持 -fps_mode，请重新运行 scripts/install_ffmpeg.sh")
+    environment = os.environ.copy()
+    environment["PATH"] = f"{ffmpeg_path.parent}{os.pathsep}{environment.get('PATH', '')}"
+    return environment
+
+
 def facefusion_execution_providers() -> list[str]:
+    swapper_model = FACEFUSION_DIR / ".assets" / "models" / "inswapper_128_fp16.onnx"
+    if not swapper_model.is_file():
+        raise FaceSwapError(
+            "FaceFusion 缺少 inswapper_128_fp16.onnx，请重新运行 scripts/install_precision_tools.sh"
+        )
     try:
         completed = subprocess.run(
             [
                 str(FACEFUSION_PYTHON), "-c",
-                "import json, onnxruntime as ort; print(json.dumps(ort.get_available_providers()))",
+                (
+                    "import json,sys,onnxruntime as ort;"
+                    "available=ort.get_available_providers();"
+                    "session=ort.InferenceSession(sys.argv[1],providers=['CUDAExecutionProvider']);"
+                    "print(json.dumps({'available':available,'session':session.get_providers()}))"
+                ),
+                str(swapper_model),
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
         )
     except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("无法检查 FaceFusion ONNX Runtime") from exc
+        raise FaceSwapError("无法检查 FaceFusion ONNX Runtime") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "未知错误").strip()[-2000:]
-        raise RuntimeError(f"检查 FaceFusion ONNX Runtime 失败：{detail}")
+        raise FaceSwapError(f"FaceFusion 无法用 CUDA 加载换脸模型：{detail}")
     try:
-        providers = json.loads(completed.stdout.strip().splitlines()[-1])
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        providers = payload.get("available") or []
+        session_providers = payload.get("session") or []
     except (IndexError, json.JSONDecodeError) as exc:
-        raise RuntimeError("FaceFusion ONNX Runtime 没有返回执行设备") from exc
-    if "CUDAExecutionProvider" not in providers:
-        raise RuntimeError(
+        raise FaceSwapError("FaceFusion ONNX Runtime 没有返回执行设备") from exc
+    if "CUDAExecutionProvider" not in providers or not session_providers \
+            or session_providers[0] != "CUDAExecutionProvider":
+        raise FaceSwapError(
             "FaceFusion CUDA 未启用，当前执行设备为 "
-            f"{', '.join(providers) or '无'}；请重新运行 scripts/install_precision_tools.sh"
+            f"{', '.join(session_providers or providers) or '无'}；"
+            "请重新运行 scripts/install_precision_tools.sh"
         )
-    return [str(provider) for provider in providers]
+    return [str(provider) for provider in session_providers]
+
+
+def build_facefusion_command(
+    face_references: list[Path], target: Path, destination: Path,
+    temp_path: Path, *, video_output: bool, detector_model: str = "yolo_face",
+) -> list[str]:
+    command = [
+        str(FACEFUSION_PYTHON), str(FACEFUSION_DIR / "facefusion.py"), "headless-run",
+        "--source-paths", *[str(path) for path in face_references],
+        "--target-path", str(target),
+        "--output-path", str(destination),
+        "--processors", "face_swapper",
+        "--face-detector-model", detector_model,
+        "--face-detector-size", "640x640",
+        "--face-detector-angles", "0", "90", "180", "270",
+        "--face-detector-score", f"{FACEFUSION_DETECTOR_SCORE:.2f}",
+        "--face-landmarker-score", f"{FACEFUSION_LANDMARKER_SCORE:.2f}",
+        "--face-selector-mode", "one",
+        "--face-selector-order", "large-small",
+        "--face-mask-types", "box", "occlusion",
+        "--face-mask-blur", "0.15",
+        "--face-swapper-model", "inswapper_128_fp16",
+        "--face-swapper-pixel-boost", "256x256",
+        "--face-swapper-weight", f"{FACEFUSION_SWAPPER_WEIGHT:.2f}",
+        "--execution-device-ids", "0",
+        "--execution-providers", "cuda",
+        "--execution-thread-count", "4",
+        "--video-memory-strategy", "tolerant",
+        "--temp-frame-format", "png",
+        "--temp-path", str(temp_path),
+        "--log-level", "debug",
+    ]
+    if video_output:
+        command.extend([
+            "--workflow-strategy", "disk",
+            "--output-audio-volume", "0",
+            "--output-video-encoder", "libx264",
+            "--output-video-preset", "veryfast",
+            "--output-video-quality", "90",
+        ])
+    else:
+        command.extend(["--output-image-quality", "100"])
+    return command
+
+
+def decoded_frame_hash(path: Path) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                "-map", "0:v:0", "-frames:v", "1", "-f", "framemd5", "-",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        raise FaceSwapError("无法验证 FaceFusion 预检画面") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "未知错误").strip()[-2000:]
+        raise FaceSwapError(f"无法验证 FaceFusion 预检画面：{detail}")
+    rows = [line for line in completed.stdout.splitlines() if line and not line.startswith("#")]
+    if not rows or "," not in rows[-1]:
+        raise FaceSwapError("FaceFusion 预检画面没有返回像素校验值")
+    return rows[-1].rsplit(",", 1)[-1].strip()
+
+
+def persist_facefusion_log(source: Path, task_name: str, suffix: str) -> None:
+    if not source.is_file():
+        return
+    try:
+        FACEFUSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, FACEFUSION_LOG_DIR / f"{task_name}-{suffix}.log")
+    except OSError:
+        pass
+
+
+def facefusion_log_used_swapper(source: Path) -> bool:
+    try:
+        log_text = source.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "loading model inswapper_128_fp16 succeeded" in log_text
 
 
 def run_facefusion(
@@ -1060,41 +1229,99 @@ def run_facefusion(
 ) -> None:
     entrypoint = FACEFUSION_DIR / "facefusion.py"
     if not FACEFUSION_PYTHON.is_file() or not entrypoint.is_file():
-        raise RuntimeError("FaceFusion 换脸工具未安装，请运行 scripts/install_precision_tools.sh")
+        raise FaceSwapError("FaceFusion 换脸工具未安装，请运行 scripts/install_precision_tools.sh")
     unload_comfy_models()
+    ffmpeg_environment = facefusion_ffmpeg_environment()
     facefusion_execution_providers()
-    run_external_command(
-        [
-            str(FACEFUSION_PYTHON), str(entrypoint), "headless-run",
-            "--source-paths", *[str(path) for path in face_references],
-            "--target-path", str(target),
-            "--output-path", str(destination),
-            "--processors", "face_swapper",
-            "--face-selector-mode", "one",
-            "--face-mask-types", "box", "occlusion", "region",
-            "--face-mask-blur", "0.15",
-            "--face-swapper-model", "inswapper_128_fp16",
-            "--face-swapper-pixel-boost", "256x256",
-            "--execution-providers", "cuda",
-            "--output-video-encoder", "libx264",
-            "--output-video-preset", "veryfast",
-            "--output-video-quality", "90",
-            "--temp-path", str(work_folder / "facefusion-temp"),
-            "--log-level", "info",
-        ],
-        "FaceFusion 人脸替换",
-        cwd=FACEFUSION_DIR,
-        log_path=work_folder / "facefusion.log",
-    )
-    ensure_visible_video(destination, "FaceFusion 输出")
+    task_name = work_folder.name
+    full_log = work_folder / "facefusion.log"
+    probe_logs: list[Path] = []
+    try:
+        duration = probe_video_duration(target)
+        probe_changed = False
+        selected_detector_model = "yolo_face"
+        for detector_model in ("yolo_face", "retinaface"):
+            for probe_index, ratio in enumerate((0.5, 0.2, 0.8), start=1):
+                probe_target = work_folder / f"facefusion_probe_target_{probe_index}.png"
+                probe_output = work_folder / f"facefusion_probe_output_{detector_model}_{probe_index}.png"
+                probe_log = work_folder / f"facefusion_probe_{detector_model}_{probe_index}.log"
+                probe_logs.append(probe_log)
+                timestamp = max(0.0, min(max(0.0, duration - 0.05), duration * ratio))
+                if not probe_target.is_file():
+                    run_ffmpeg(
+                        [
+                            "-ss", f"{timestamp:.3f}", "-i", str(target),
+                            "-frames:v", "1", str(probe_target),
+                        ],
+                        "提取 FaceFusion 人脸预检画面",
+                    )
+                if video_appears_black(probe_target):
+                    continue
+                run_external_command(
+                    build_facefusion_command(
+                        face_references, probe_target, probe_output,
+                        work_folder / "facefusion-probe-temp", video_output=False,
+                        detector_model=detector_model,
+                    ),
+                    f"FaceFusion 人脸预检 {detector_model} {probe_index}/3",
+                    cwd=FACEFUSION_DIR,
+                    log_path=probe_log,
+                    environment=ffmpeg_environment,
+                )
+                if not probe_output.is_file() or probe_output.stat().st_size == 0:
+                    raise FaceSwapError("FaceFusion 人脸预检没有生成画面")
+                if video_appears_black(probe_output):
+                    raise FaceSwapError(
+                        f"FaceFusion 人脸预检 {detector_model} {probe_index}/3 输出黑屏，"
+                        "换脸结果无效，请检查保留的预检图片和日志"
+                    )
+                if facefusion_log_used_swapper(probe_log) and \
+                        decoded_frame_hash(probe_target) != decoded_frame_hash(probe_output):
+                    probe_changed = True
+                    selected_detector_model = detector_model
+                    break
+            if probe_changed:
+                break
+        if not probe_changed:
+            raise FaceSwapError(
+                "FaceFusion 用 YOLO 和 RetinaFace 检查视频的中段、前段和后段，"
+                "仍没有检测到可替换的人脸，已停止任务。"
+                "请使用正面、清晰且脸部占比更大的参考图，并确认图片类型选择为“脸部参考图”"
+            )
+        run_external_command(
+            build_facefusion_command(
+                face_references, target, destination,
+                work_folder / "facefusion-temp", video_output=True,
+                detector_model=selected_detector_model,
+            ),
+            "FaceFusion 人脸替换",
+            cwd=FACEFUSION_DIR,
+            log_path=full_log,
+            environment=ffmpeg_environment,
+        )
+        ensure_visible_video(destination, "FaceFusion 输出")
+        if not facefusion_log_used_swapper(full_log):
+            raise FaceSwapError(
+                "FaceFusion 已生成视频，但整段处理时没有找到可替换的人脸；"
+                "请检查原视频中的脸部是否清晰、足够大，以及保留的 FaceFusion 日志"
+            )
+    except FaceSwapError:
+        raise
+    except Exception as exc:
+        raise FaceSwapError(str(exc)) from exc
+    finally:
+        for probe_log in probe_logs:
+            persist_facefusion_log(probe_log, task_name, probe_log.stem)
+        persist_facefusion_log(full_log, task_name, "run")
 
 
 def restore_original_audio(processed: Path, source: Path, destination: Path) -> None:
+    duration = probe_video_duration(source)
     run_ffmpeg(
         [
             "-i", str(processed), "-i", str(source),
             "-map", "0:v:0", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac",
-            "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(destination),
+            "-b:a", "192k", "-t", f"{duration:.3f}", "-movflags", "+faststart", str(destination),
         ],
         "恢复原视频声音",
     )
@@ -1106,10 +1333,14 @@ def split_source_video(source: Path, durations: list[float], work_folder: Path) 
     start = 0.0
     for index, duration in enumerate(durations, start=1):
         destination = work_folder / f"source_part_{index:03d}.mp4"
+        frame_count = vace_frame_count(duration)
         run_ffmpeg(
             [
-                "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{duration:.3f}",
-                "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+                "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
+                "-map", "0:v:0", "-map", "0:a?",
+                "-vf", f"fps={VACE_FPS},tpad=stop_mode=clone:stop_duration={1 / VACE_FPS:.8f}",
+                "-frames:v", str(frame_count),
+                "-c:v", "libx264", "-preset", "veryfast",
                 "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart", str(destination),
             ],
@@ -1120,6 +1351,59 @@ def split_source_video(source: Path, durations: list[float], work_folder: Path) 
         parts.append(destination)
         start += duration
     return parts
+
+
+def split_mask_video(mask: Path, durations: list[float], work_folder: Path) -> list[Path]:
+    work_folder.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    start = 0.0
+    for index, duration in enumerate(durations, start=1):
+        destination = work_folder / f"mask_part_{index:03d}.mp4"
+        frame_count = vace_frame_count(duration)
+        run_ffmpeg(
+            [
+                "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(mask),
+                "-map", "0:v:0",
+                "-vf", f"fps={VACE_FPS},tpad=stop_mode=clone:stop_duration={1 / VACE_FPS:.8f}",
+                "-frames:v", str(frame_count), "-an", "-c:v", "libx264",
+                "-preset", "veryfast", "-crf", "0", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", str(destination),
+            ],
+            f"切割第 {index}/{len(durations)} 段商品蒙版",
+        )
+        if not destination.is_file() or destination.stat().st_size == 0:
+            raise RuntimeError(f"切割第 {index}/{len(durations)} 段商品蒙版后没有生成文件")
+        parts.append(destination)
+        start += duration
+    return parts
+
+
+def composite_product_region(
+    source: Path, generated: Path, mask: Path, destination: Path,
+) -> None:
+    """Use VACE pixels only inside the tracked product, preserving the source elsewhere."""
+    dimensions = probe_video_dimensions(source)
+    if not dimensions:
+        raise RuntimeError("无法读取原视频片段尺寸，不能合成商品区域")
+    width, height = dimensions
+    filter_graph = (
+        f"[0:v]fps={VACE_FPS},scale={width}:{height}:flags=lanczos,setsar=1,format=gbrp[base];"
+        f"[1:v]fps={VACE_FPS},scale={width}:{height}:flags=lanczos,setsar=1,format=gbrp[edit];"
+        f"[2:v]fps={VACE_FPS},scale={width}:{height}:flags=neighbor,"
+        "format=gray,lut=y='if(gte(val,128),255,0)',gblur=sigma=1,format=gbrp[region];"
+        "[base][edit][region]maskedmerge[out]"
+    )
+    run_ffmpeg(
+        [
+            "-i", str(source), "-i", str(generated), "-i", str(mask),
+            "-filter_complex", filter_graph,
+            "-map", "[out]", "-an", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-r", str(VACE_FPS),
+            "-movflags", "+faststart", str(destination),
+        ],
+        "只合成商品蒙版区域",
+    )
+    ensure_visible_video(destination, "商品区域合成视频")
 
 
 def concat_generated_videos(parts: list[Path], destination: Path, work_folder: Path) -> None:
@@ -1217,7 +1501,7 @@ def mark_task(task_id: str, **values: Any) -> None:
 
 def run_comfy_segment(
     task_id: str, segment_row: dict[str, Any], segment_index: int, segment_count: int,
-    destination: Path,
+    destination: Path, mask_source: Path, product_reference: Path,
 ) -> bool:
     prompt_id: str | None = None
     comfy_input_folder: Path | None = None
@@ -1231,17 +1515,22 @@ def run_comfy_segment(
                     stage="任务已取消", finished_at=utcnow(),
                 )
             return False
-        mark_segment_task(task_id, segment_index, segment_count, "复制视频和参考图片", 8)
-        source_upload, reference_uploads, comfy_input_folder = prepare_comfy_inputs(segment_row)
-        mark_segment_task(task_id, segment_index, segment_count, "构建 MiniMax-H3 工作流", 12)
-        workflow = build_comfy_workflow(segment_row, source_upload, reference_uploads)
-        workflow_size = workflow["136"]["inputs"]
+        ensure_vace_node_available()
+        mark_segment_task(task_id, segment_index, segment_count, "复制视频、蒙版和商品参考图", 8)
+        source_upload, mask_upload, reference_upload, comfy_input_folder = prepare_vace_inputs(
+            segment_row, mask_source, product_reference
+        )
+        mark_segment_task(task_id, segment_index, segment_count, "构建 VACE 精准重绘工作流", 12)
+        workflow = build_comfy_workflow(
+            segment_row, source_upload, mask_upload, reference_upload
+        )
+        workflow_size = workflow["21"]["inputs"]
         mark_task(
             task_id,
             output_width=int(workflow_size["width"]),
             output_height=int(workflow_size["height"]),
         )
-        client_id = f"h3-studio-{task_id}-{segment_index}"
+        client_id = f"vace-studio-{task_id}-{segment_index}"
         websocket = open_comfy_websocket(client_id)
         mark_segment_task(task_id, segment_index, segment_count, "提交任务到 ComfyUI", 14)
         submitted = http_json(
@@ -1331,157 +1620,107 @@ def process_task(row: sqlite3.Row) -> None:
     destination = OUTPUT_DIR / f"{task_id}.mp4"
     keep_work_folder = False
     try:
-        precision_mode = bool(row["precision_mode"]) if "precision_mode" in row.keys() else False
         face_sources = row_reference_paths(row, "face")
         product_sources = row_reference_paths(row, "product")
-        explicit_roles = bool(face_sources or product_sources)
-        precision_mode = precision_mode and explicit_roles
+        if not face_sources and not product_sources:
+            raise RuntimeError("请至少提供一张脸部参考图或商品参考图，并选择正确用途")
+        if product_sources and int(row["steps"] or DEFAULT_STEPS) < 30:
+            raise RuntimeError("此任务的 VACE Steps 低于 30，无法获得可靠的商品替换效果；请用 50 Steps 重新创建任务")
+        if face_sources:
+            facefusion_ffmpeg_environment()
         durations = segment_durations(float(row["duration"]))
-        segment_count = len(durations) if (not precision_mode or product_sources) else 1
+        segment_count = len(durations) if product_sources else 1
         mark_task(task_id, segment_count=segment_count, current_segment=0)
         shutil.rmtree(work_folder, ignore_errors=True)
         work_folder.mkdir(parents=True, exist_ok=True)
 
-        if precision_mode:
-            mark_task(task_id, status="running", stage="读取原视频", progress=6)
-            local_source = local_source_for_split(row, work_folder)
-            dimensions = probe_video_dimensions(local_source)
-            if dimensions:
-                mark_task(task_id, output_width=dimensions[0], output_height=dimensions[1])
+        mark_task(task_id, status="running", stage="读取原视频", progress=6)
+        local_source = local_source_for_split(row, work_folder)
+        dimensions = probe_video_dimensions(local_source)
+        if dimensions:
+            mark_task(task_id, output_width=dimensions[0], output_height=dimensions[1])
 
-            working_video = local_source
-            if product_sources:
-                product_box = parse_product_box(row)
-                mark_task(task_id, stage="准备商品参考图", progress=7)
-                product_references = materialize_reference_images(
-                    product_sources, work_folder, "product_reference"
-                )
-                if len(durations) > 1:
-                    mark_task(task_id, stage=f"正在切割源视频（共 {len(durations)} 段）", progress=7)
-                    source_parts: list[str | Path] = split_source_video(
-                        local_source, durations, work_folder / "source-parts"
-                    )
-                else:
-                    source_parts = [local_source]
-
-                product_row = dict(row)
-                product_row["reference_images"] = json.dumps(product_sources, ensure_ascii=False)
-                product_row["reference_roles"] = json.dumps(
-                    ["product"] * len(product_sources), ensure_ascii=False
-                )
-                original_roles = row_reference_roles(row)
-                product_indices = [
-                    index for index, role in enumerate(original_roles, start=1)
-                    if role == "product"
-                ]
-                mapping = "；".join(
-                    f"当前参考图{new_index}对应原任务参考图{original_index}"
-                    for new_index, original_index in enumerate(product_indices, start=1)
-                )
-                original_prompt = str(row["prompt"] or "").strip()
-                product_row["prompt"] = (
-                    "这是商品专用生成步骤，当前提供的所有参考图都只用于商品外观。"
-                    f"{mapping}。只执行原提示词中的商品或服装替换，忽略人物和脸部替换要求。"
-                    f"原提示词：{original_prompt}"
-                )
-                generated_parts: list[Path] = []
-                for index, (source_part, part_duration) in enumerate(
-                    zip(source_parts, durations), start=1
-                ):
-                    segment_row = dict(product_row)
-                    segment_row["id"] = f"{task_id}_product_{index:03d}"
-                    segment_row["source_video"] = str(source_part)
-                    segment_row["duration"] = part_duration
-                    segment_destination = work_folder / f"product_candidate_{index:03d}.mp4"
-                    if not run_comfy_segment(
-                        task_id, segment_row, index, len(durations), segment_destination
-                    ):
-                        return
-                    generated_parts.append(segment_destination)
-
-                if task_was_cancelled(task_id, destination):
-                    return
-                candidate = work_folder / "product_candidate.mp4"
-                mark_task(
-                    task_id, progress=94,
-                    stage="合并商品候选片段" if len(generated_parts) > 1 else "准备商品候选视频",
-                )
-                concat_generated_videos(generated_parts, candidate, work_folder)
-                ensure_visible_video(candidate, "MiniMax-H3 商品候选视频")
-                product_stage = (
-                    "SAM2 跟踪修正后的商品区域"
-                    if product_box is not None
-                    else "AI 识别并跟踪商品区域"
-                )
-                mark_task(task_id, status="running", progress=95, stage=product_stage)
-                product_composite = work_folder / "product_composite.mp4"
-                run_product_mask_composite(
-                    local_source, candidate, product_box, product_references[0],
-                    str(row["prompt"] or ""), product_composite, work_folder,
-                )
-                ensure_visible_video(product_composite, "SAM2 商品合成视频")
-                working_video = product_composite
-
-            if task_was_cancelled(task_id, destination):
-                return
-            if face_sources:
-                mark_task(task_id, status="running", progress=97, stage="准备人脸参考图")
-                face_references = materialize_reference_images(
-                    face_sources, work_folder, "face_reference"
-                )
-                face_output = work_folder / "face_swapped.mp4"
-                mark_task(task_id, progress=98, stage="FaceFusion 替换脸部")
-                run_facefusion(face_references, working_video, face_output, work_folder)
-                working_video = face_output
-
-            if task_was_cancelled(task_id, destination):
-                return
-            mark_task(task_id, progress=99, stage="恢复原视频声音")
-            restore_original_audio(working_video, local_source, destination)
-            ensure_visible_video(destination, "最终视频")
-            if task_was_cancelled(task_id, destination):
-                return
+        working_video = local_source
+        if product_sources:
+            product_box = parse_product_box(row)
             mark_task(
-                task_id, status="completed", progress=100, output_path=str(destination),
-                stage="精准替换完成", current_segment=segment_count, engine_job_id=None,
-                finished_at=utcnow(), error=None,
+                task_id, progress=7,
+                stage="SAM2 跟踪修正后的商品区域" if product_box else "AI 定位并跟踪商品区域",
             )
-            return
+            product_reference = materialize_reference_images(
+                product_sources[:1], work_folder, "product_reference"
+            )[0]
+            full_mask = work_folder / "product_mask.mp4"
+            run_product_mask_tracking(
+                local_source, product_box, product_reference, str(row["prompt"] or ""),
+                full_mask, work_folder,
+            )
 
-        if segment_count > 1:
-            mark_task(task_id, stage=f"正在切割源视频（共 {segment_count} 段）", progress=6)
-            local_source = local_source_for_split(row, work_folder)
-            source_parts = split_source_video(local_source, durations, work_folder)
-        else:
-            source_parts = [row["source_video"]]
-
-        generated_parts: list[Path] = []
-        for index, (source_part, part_duration) in enumerate(zip(source_parts, durations), start=1):
-            segment_row = dict(row)
-            segment_row["id"] = f"{task_id}_part_{index:03d}"
-            segment_row["source_video"] = str(source_part)
-            segment_row["duration"] = part_duration
-            segment_destination = work_folder / f"generated_part_{index:03d}.mp4"
-            if not run_comfy_segment(
-                task_id, segment_row, index, segment_count, segment_destination
+            mark_task(task_id, stage=f"准备 VACE 视频片段（共 {len(durations)} 段）", progress=8)
+            source_parts = split_source_video(
+                local_source, durations, work_folder / "source-parts"
+            )
+            mask_parts = split_mask_video(
+                full_mask, durations, work_folder / "mask-parts"
+            )
+            generated_parts: list[Path] = []
+            for index, (source_part, mask_part, part_duration) in enumerate(
+                zip(source_parts, mask_parts, durations), start=1
             ):
+                segment_row = dict(row)
+                segment_row["id"] = f"{task_id}_product_{index:03d}"
+                segment_row["source_video"] = str(source_part)
+                segment_row["duration"] = part_duration
+                segment_destination = work_folder / f"vace_product_{index:03d}.mp4"
+                if not run_comfy_segment(
+                    task_id, segment_row, index, len(durations), segment_destination,
+                    mask_part, product_reference,
+                ):
+                    return
+                ensure_visible_video(segment_destination, f"第 {index} 段 VACE 生成视频")
+                composited_destination = work_folder / f"product_composited_{index:03d}.mp4"
+                composite_product_region(
+                    source_part, segment_destination, mask_part, composited_destination,
+                )
+                generated_parts.append(composited_destination)
+
+            if task_was_cancelled(task_id, destination):
                 return
-            generated_parts.append(segment_destination)
+            product_output = work_folder / "product_replaced.mp4"
+            mark_task(
+                task_id, progress=95,
+                stage="合并 VACE 精准替换片段" if len(generated_parts) > 1 else "检查 VACE 精准替换结果",
+            )
+            concat_generated_videos(generated_parts, product_output, work_folder)
+            ensure_visible_video(product_output, "VACE 商品精准替换视频")
+            working_video = product_output
 
         if task_was_cancelled(task_id, destination):
             return
-        mark_task(task_id, progress=96, stage="合并生成片段" if segment_count > 1 else "保存生成视频")
-        concat_generated_videos(generated_parts, destination, work_folder)
+        if face_sources:
+            mark_task(task_id, status="running", progress=97, stage="准备人脸参考图")
+            face_references = materialize_reference_images(
+                face_sources[:1], work_folder, "face_reference"
+            )
+            face_output = work_folder / "face_swapped.mp4"
+            mark_task(task_id, progress=98, stage="FaceFusion CUDA 人脸预检与精准替换")
+            run_facefusion(face_references, working_video, face_output, work_folder)
+            working_video = face_output
+
+        if task_was_cancelled(task_id, destination):
+            return
+        mark_task(task_id, progress=99, stage="恢复原视频声音与时长")
+        restore_original_audio(working_video, local_source, destination)
         ensure_visible_video(destination, "最终视频")
         if task_was_cancelled(task_id, destination):
             return
         mark_task(
             task_id, status="completed", progress=100, output_path=str(destination),
-            stage="生成完成", current_segment=segment_count, engine_job_id=None,
+            stage="精准替换完成", current_segment=segment_count, engine_job_id=None,
             finished_at=utcnow(), error=None,
         )
     except Exception as exc:
-        keep_work_folder = isinstance(exc, BlackVideoError)
+        keep_work_folder = isinstance(exc, (BlackVideoError, FaceSwapError, ProductMaskError))
         destination.unlink(missing_ok=True)
         detail = str(exc)
         if keep_work_folder:
@@ -1509,7 +1748,7 @@ async def lifespan(_: FastAPI):
     global worker_thread
     init_db()
     worker_stop.clear()
-    worker_thread = threading.Thread(target=worker_loop, name="h3-task-worker", daemon=True)
+    worker_thread = threading.Thread(target=worker_loop, name="vace-task-worker", daemon=True)
     worker_thread.start()
     yield
     worker_stop.set()
@@ -1517,7 +1756,7 @@ async def lifespan(_: FastAPI):
         worker_thread.join(timeout=5)
 
 
-app = FastAPI(title="MiniMax H3 Video Studio", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="VACE 精准视频替换工作台", version="4.0.0", lifespan=lifespan)
 
 
 @app.get("/api/config")
@@ -1547,15 +1786,21 @@ def system_status() -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     engine_ok = False
+    vace_node = False
     try:
         req = urllib.request.Request(f"{COMFYUI_URL}/system_stats")
         with urllib.request.urlopen(req, timeout=2) as response:
             engine_ok = response.status < 500
+        if engine_ok:
+            req = urllib.request.Request(f"{COMFYUI_URL}/object_info/WanVaceToVideo")
+            with urllib.request.urlopen(req, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                vace_node = "WanVaceToVideo" in payload
     except Exception:
         pass
     return {
         "app": "ok", "engine": "ok" if engine_ok else "unavailable",
-        "engine_name": "ComfyUI", "engine_url": COMFYUI_URL,
+        "engine_name": "ComfyUI", "engine_url": COMFYUI_URL, "vace_node": vace_node,
     }
 
 
@@ -1580,8 +1825,8 @@ async def create_manual_task(
         raise HTTPException(400, "请至少上传一个视频")
     if len([item for item in upload_videos if item.filename]) > 3:
         raise HTTPException(400, "一次最多上传 3 个视频")
-    if len([item for item in reference_images if item.filename]) > 9:
-        raise HTTPException(400, "参考图片最多上传 9 张")
+    if len([item for item in reference_images if item.filename]) > 2:
+        raise HTTPException(400, "精准替换最多上传 2 张参考图：1 张脸部图和 1 张商品图")
     try:
         hints_raw = json.loads(video_durations)
         duration_hints = [float(value) for value in hints_raw] if isinstance(hints_raw, list) else []
@@ -1619,10 +1864,9 @@ async def create_manual_task(
             duration = probe_video_duration(saved_video, hint)
             prepared.append((saved_video, original_name, duration))
 
-        if saved_references and not parsed_roles:
-            parsed_roles = ["auto"] * len(saved_references)
-            precision_mode = False
-        elif saved_references and len(parsed_roles) != len(saved_references):
+        if not saved_references:
+            raise ValueError("请至少上传一张脸部参考图或商品参考图")
+        if len(parsed_roles) != len(saved_references):
             raise ValueError("请为每张参考图片选择“脸部”或“商品”")
         validate_task_values(
             prepared[0][2], aspect_ratio, quality, sampler, scheduler, steps, denoise
@@ -1633,7 +1877,7 @@ async def create_manual_task(
                 prompt=prompt, source_video=saved_video, reference_images=saved_references,
                 duration=duration, aspect_ratio=aspect_ratio, seed=seed, quality=quality,
                 display_name=original_name, reference_roles=parsed_roles,
-                product_box=product_box, precision_mode=precision_mode,
+                product_box=product_box, precision_mode=True,
                 sampler=sampler, scheduler=scheduler, steps=steps, denoise=denoise,
             ))
         return {"created": len(created), "task_ids": created, "status": "queued"}
@@ -1702,8 +1946,8 @@ async def import_excel_tasks(
                     validate_public_media_url(item.strip(), "reference_image_url")
                     for item in re.split(r"[,，;；\n]+", text_cell(cell("reference_image_urls"))) if item.strip()
                 ]
-                if len(reference_urls) > 9:
-                    raise ValueError("reference_image_urls 最多填写 9 个图片 URL")
+                if len(reference_urls) > 2:
+                    raise ValueError("reference_image_urls 最多填写 2 个图片 URL：1 张脸部图和 1 张商品图")
                 reference_roles = [
                     item.strip().lower()
                     for item in re.split(r"[,，;；\n]+", text_cell(cell("reference_roles"))) if item.strip()
@@ -1806,6 +2050,31 @@ def task_output(task_id: str):
     return FileResponse(row["output_path"], media_type="video/mp4", filename=filename)
 
 
+@app.get("/api/tasks/{task_id}/media/{kind}/{index}")
+def task_media(task_id: str, kind: str, index: int):
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id=? AND deleted_at IS NULL", (task_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "任务不存在")
+    if kind == "source" and index == 0:
+        source = str(row["source_video"])
+    elif kind == "reference":
+        references = row_reference_paths(row)
+        if index < 0 or index >= len(references):
+            raise HTTPException(404, "参考图片不存在")
+        source = references[index]
+    else:
+        raise HTTPException(404, "素材不存在")
+    if is_http_url(source):
+        return RedirectResponse(source)
+    path = Path(source)
+    if not path.is_file():
+        raise HTTPException(404, "素材文件不存在")
+    return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0])
+
+
 @app.get("/api/template")
 def excel_template() -> StreamingResponse:
     workbook = Workbook()
@@ -1822,7 +2091,7 @@ def excel_template() -> StreamingResponse:
         "https://your-domain.example/images/person.jpg\nhttps://your-domain.example/images/product.png",
         "face\nproduct", "",
         "将视频中的人物脸部换成参考图1，人物身上的上衣换成参考图2，并保持手部遮挡自然。",
-        "auto", "low", "", "simple", "res_multistep", 20, 1.0,
+        "auto", "low", "", "simple", "uni_pc", 50, 1.0,
     ])
     header_fill = PatternFill("solid", fgColor="253449")
     for cell in sheet[1]:
@@ -1839,18 +2108,18 @@ def excel_template() -> StreamingResponse:
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = "A1:L2"
     sheet["A1"].comment = Comment(
-        "必填；用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。",
-        "MiniMax H3 Studio",
+        "必填；用户自行提供可公开访问的视频 URL。不能短于 1 秒；商品替换会按最长 5 秒自动分段并合并。",
+        "VACE Precision Studio",
     )
-    sheet["B1"].comment = Comment("可选；用户自行提供人物或商品图片 URL，每行一个，最多 9 个。", "MiniMax H3 Studio")
-    sheet["C1"].comment = Comment("有参考图时必填；与图片逐行对应，只能填 face 或 product。", "MiniMax H3 Studio")
-    sheet["D1"].comment = Comment("可选；AI 默认根据提示词和商品参考图定位。识别不准时填写首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "MiniMax H3 Studio")
-    sheet["G1"].comment = Comment("可选；low、standard 或 high。默认 low，速度最快。", "MiniMax H3 Studio")
-    sheet["I1"].comment = Comment("可选；噪声调度器，默认 simple。", "MiniMax H3 Studio")
-    sheet["J1"].comment = Comment("可选；采样器，默认 res_multistep。", "MiniMax H3 Studio")
-    sheet["K1"].comment = Comment("可选；采样步数 1–100，默认 20。", "MiniMax H3 Studio")
-    sheet["L1"].comment = Comment("可选；生成变化强度 0.01–1.00，默认 1.0。", "MiniMax H3 Studio")
-    ratio_validation = DataValidation(type="list", formula1='"auto,16:9,9:16,1:1,4:3,3:4,21:9"')
+    sheet["B1"].comment = Comment("必填；用户自行提供图片 URL，每行一个。脸部图和商品图各最多 1 张。", "VACE Precision Studio")
+    sheet["C1"].comment = Comment("必填；与图片逐行对应，只能填 face 或 product。", "VACE Precision Studio")
+    sheet["D1"].comment = Comment("可选；AI 默认根据提示词和商品参考图定位。识别不准时填写首帧商品框的 0–1 坐标 x1,y1,x2,y2。", "VACE Precision Studio")
+    sheet["G1"].comment = Comment("可选；low=832×480、standard=960×544、high=1280×720（以 16:9 为例）。", "VACE Precision Studio")
+    sheet["I1"].comment = Comment("可选；VACE 噪声调度器，默认 simple。", "VACE Precision Studio")
+    sheet["J1"].comment = Comment("可选；VACE 采样器，默认 uni_pc。", "VACE Precision Studio")
+    sheet["K1"].comment = Comment("可选；采样步数 30–100，默认 50。低于 30 步会明显影响替换效果。", "VACE Precision Studio")
+    sheet["L1"].comment = Comment("可选；蒙版区域重绘强度 0.01–1.00，默认 1.0。", "VACE Precision Studio")
+    ratio_validation = DataValidation(type="list", formula1='"auto"')
     sheet.add_data_validation(ratio_validation)
     ratio_validation.add("F2:F1000")
     quality_validation = DataValidation(type="list", formula1='"low,standard,high"')
@@ -1859,10 +2128,10 @@ def excel_template() -> StreamingResponse:
     scheduler_validation = DataValidation(type="list", formula1='"simple,normal,karras,exponential,sgm_uniform"')
     sheet.add_data_validation(scheduler_validation)
     scheduler_validation.add("I2:I1000")
-    sampler_validation = DataValidation(type="list", formula1='"res_multistep,euler,euler_ancestral,heun,dpmpp_2m,dpmpp_2m_sde"')
+    sampler_validation = DataValidation(type="list", formula1='"uni_pc,euler,euler_ancestral,heun,dpmpp_2m,dpmpp_2m_sde"')
     sheet.add_data_validation(sampler_validation)
     sampler_validation.add("J2:J1000")
-    steps_validation = DataValidation(type="whole", operator="between", formula1="1", formula2="100")
+    steps_validation = DataValidation(type="whole", operator="between", formula1="30", formula2="100")
     sheet.add_data_validation(steps_validation)
     steps_validation.add("K2:K1000")
     denoise_validation = DataValidation(type="decimal", operator="between", formula1="0.01", formula2="1")
@@ -1872,18 +2141,18 @@ def excel_template() -> StreamingResponse:
     guide = workbook.create_sheet("字段说明")
     guide.append(["字段", "是否必填", "说明"])
     guide_rows = [
-        ("upload_video_url", "是", "用户自行提供可公开访问的视频 URL。不能短于 4 秒；超过 15 秒会自动分段生成并合并。"),
-        ("reference_image_urls", "否", "用户自行提供人物和商品参考图片 URL；每行一个，最多 9 个。"),
-        ("reference_roles", "有参考图时是", "与 reference_image_urls 逐行对应。脸部图填 face，商品图填 product。"),
+        ("upload_video_url", "是", "用户自行提供可公开访问的视频 URL。不能短于 1 秒；商品替换会按最长 5 秒自动分段并合并。"),
+        ("reference_image_urls", "是", "用户自行提供参考图片 URL；每行一个。脸部图和商品图各最多 1 张。"),
+        ("reference_roles", "是", "与 reference_image_urls 逐行对应。脸部图填 face，商品图填 product。"),
         ("product_box", "否", "AI 默认自动定位。识别不准时填写首帧原商品框的 0–1 坐标 x1,y1,x2,y2，例如 0.42,0.46,0.72,0.88。"),
         ("prompt", "否", "写清商品目标会提高定位准确率，例如“人物身上的上衣换成参考图2”。"),
-        ("aspect_ratio", "否", "默认 auto，跟随上传视频比例；也可指定固定比例。"),
+        ("aspect_ratio", "否", "固定填写 auto，精准替换始终跟随上传视频比例。"),
         ("quality", "否", "清晰度：low（低清，默认且最快）、standard（标清）或 high（高清且最慢）。"),
         ("seed", "否", "固定随机种子便于复现；空白时自动生成。"),
         ("scheduler", "否", "噪声调度器：simple（默认）、normal、karras、exponential 或 sgm_uniform。"),
-        ("sampler", "否", "采样器：res_multistep（默认）、euler、euler_ancestral、heun、dpmpp_2m 或 dpmpp_2m_sde。"),
-        ("steps", "否", "采样步数 1–100，默认 20；通常越高越慢。"),
-        ("denoise", "否", "生成变化强度 0.01–1.00，默认 1.0；越低越接近输入。"),
+        ("sampler", "否", "VACE 采样器：uni_pc（默认）、euler、euler_ancestral、heun、dpmpp_2m 或 dpmpp_2m_sde。"),
+        ("steps", "否", "采样步数 30–100，默认 50；低于 30 步会明显影响替换效果。"),
+        ("denoise", "否", "蒙版区域重绘强度 0.01–1.00，默认 1.0；越低越接近原商品。"),
     ]
     for row in guide_rows:
         guide.append(row)
@@ -1898,7 +2167,7 @@ def excel_template() -> StreamingResponse:
     content = io.BytesIO()
     workbook.save(content)
     content.seek(0)
-    headers_out = {"Content-Disposition": 'attachment; filename="h3_tasks_template.xlsx"'}
+    headers_out = {"Content-Disposition": 'attachment; filename="vace_precision_tasks.xlsx"'}
     return StreamingResponse(
         content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

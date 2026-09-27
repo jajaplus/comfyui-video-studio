@@ -28,10 +28,10 @@ python3 -m venv .venv
 mkdir -p logs
 
 if grep -Rqs --exclude-dir=.git --exclude-dir=.venv \
-  "MiniMaxH3ReferenceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
-  echo "已检测到 MiniMaxH3ReferenceToVideo 原生节点。"
+  "WanVaceToVideo" "$COMFY_DIR/comfy" "$COMFY_DIR/comfy_extras"; then
+  echo "已检测到 WanVaceToVideo 原生节点。"
 else
-  echo "警告：当前 ComfyUI 未检测到 MiniMaxH3ReferenceToVideo。请按 README 第 2.2 节安装独立的 ComfyUI，不要修改镜像自带目录。" >&2
+  echo "警告：当前 ComfyUI 未检测到 WanVaceToVideo。请按 README 的 ComfyUI 准备步骤更新或安装支持 VACE 的版本。" >&2
 fi
 
 echo "客户端依赖安装完成；已复用 $COMFY_DIR。"

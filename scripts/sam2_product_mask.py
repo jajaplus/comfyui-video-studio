@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatically locate or manually box a product, track it, and composite that region."""
+"""Locate a product and track it through a video, producing a VACE inpaint mask."""
 
 from __future__ import annotations
 
@@ -72,15 +72,6 @@ def extract_frames(source: Path, destination: Path, extension: str, fps: float) 
         ],
         f"读取 {source.name} 的视频帧",
     )
-
-
-def load_resized(path: Path, width: int, height: int) -> np.ndarray:
-    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise RuntimeError(f"无法读取视频帧：{path.name}")
-    if frame.shape[1] != width or frame.shape[0] != height:
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
-    return frame
 
 
 def target_from_text(text: str) -> str | None:
@@ -238,7 +229,6 @@ def auto_product_box(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--box")
     parser.add_argument("--product-reference", type=Path)
@@ -247,6 +237,7 @@ def main() -> None:
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--model-config", default="configs/sam2.1/sam2.1_hiera_s.yaml")
+    parser.add_argument("--fps", type=float, default=16.0)
     parser.add_argument("--work-dir", required=True, type=Path)
     args = parser.parse_args()
 
@@ -260,17 +251,14 @@ def main() -> None:
 
     shutil.rmtree(args.work_dir, ignore_errors=True)
     source_dir = args.work_dir / "source"
-    candidate_dir = args.work_dir / "candidate"
-    output_dir = args.work_dir / "composite"
+    output_dir = args.work_dir / "masks"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fps = video_fps(args.source)
+    fps = args.fps if 1 <= args.fps <= 120 else video_fps(args.source)
     extract_frames(args.source, source_dir, "jpg", fps)
-    extract_frames(args.candidate, candidate_dir, "png", fps)
     source_frames = sorted(source_dir.glob("*.jpg"))
-    candidate_frames = sorted(candidate_dir.glob("*.png"))
-    if not source_frames or not candidate_frames:
-        raise RuntimeError("源视频或 H3 商品候选视频没有可读取的画面")
+    if not source_frames:
+        raise RuntimeError("源视频没有可读取的画面")
 
     first = cv2.imread(str(source_frames[0]), cv2.IMREAD_COLOR)
     if first is None:
@@ -300,38 +288,33 @@ def main() -> None:
     )
 
     written: set[int] = set()
-    dilation = max(3, round(min(width, height) * 0.008))
-    if dilation % 2 == 0:
-        dilation += 1
-    feather = max(5, round(min(width, height) * 0.012))
-    if feather % 2 == 0:
-        feather += 1
-    kernel = np.ones((dilation, dilation), np.uint8)
-
     with torch.inference_mode():
         for frame_index, object_ids, mask_logits in predictor.propagate_in_video(inference_state):
             index = int(frame_index)
             if index < 0 or index >= len(source_frames):
                 continue
-            source = load_resized(source_frames[index], width, height)
-            candidate_index = min(index, len(candidate_frames) - 1)
-            candidate = load_resized(candidate_frames[candidate_index], width, height)
             if len(object_ids) and mask_logits.shape[0]:
                 mask = (mask_logits[0] > 0.0).detach().cpu().numpy().squeeze().astype(np.uint8) * 255
                 if mask.shape != (height, width):
                     mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                mask = cv2.dilate(mask, kernel, iterations=1)
-                alpha = cv2.GaussianBlur(mask, (feather, feather), 0).astype(np.float32) / 255.0
-                alpha = alpha[..., None]
-                composite = (candidate.astype(np.float32) * alpha + source.astype(np.float32) * (1 - alpha)).astype(np.uint8)
             else:
-                composite = source
-            cv2.imwrite(str(output_dir / f"{index:06d}.png"), composite)
+                mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.imwrite(str(output_dir / f"{index:06d}.png"), mask)
             written.add(index)
 
-    for index, source_path in enumerate(source_frames):
+    for index, _source_path in enumerate(source_frames):
         if index not in written:
-            shutil.copy2(source_path, output_dir / f"{index:06d}.png")
+            cv2.imwrite(
+                str(output_dir / f"{index:06d}.png"),
+                np.zeros((height, width), dtype=np.uint8),
+            )
+
+    first_mask = cv2.imread(str(output_dir / "000000.png"), cv2.IMREAD_GRAYSCALE)
+    if first_mask is None or np.count_nonzero(first_mask) < max(64, int(height * width * 0.0002)):
+        raise RuntimeError(
+            "SAM2 没有在视频首帧得到足够的商品蒙版，继续生成只会保留原商品；"
+            "请在视频预览里手动框选原商品区域"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     run(
@@ -339,9 +322,9 @@ def main() -> None:
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-framerate", f"{fps:.8f}", "-start_number", "0",
             "-i", str(output_dir / "%06d.png"), "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", "16", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(args.output),
+            "-crf", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(args.output),
         ],
-        "编码商品局部合成视频",
+        "编码商品跟踪蒙版视频",
     )
 
 

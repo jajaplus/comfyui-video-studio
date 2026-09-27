@@ -1,5 +1,5 @@
 # ComfyUI 工作流
 
-`minimax_h3_ref2va_api.json` 是供 ComfyUI `/prompt` 接口使用的 API 格式工作流，来源于 Comfy-Org 官方 `video_minimax_h3_r2v` 模板。应用会在提交前替换提示词、时长、比例、种子、模型文件名、上传视频和参考图片。
+`wan_vace_inpaint_api.json` 是供 ComfyUI `/prompt` 接口使用的 API 工作流。应用会把原视频、SAM2 逐帧商品蒙版和商品参考图传入 Wan2.1 VACE；蒙版内先填中性灰，再生成商品并合成回原视频。默认使用 50 步采样和 VACE 的 16.0 采样偏移。提交前会设置提示词、尺寸、帧数和种子。
 
-来源：https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json
+参考官方工作流：https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_wan_vace_inpainting.json

@@ -4,6 +4,7 @@ const state = {
   selectedImages: [],
   referenceRoles: new Map(),
   productBoxes: new Map(),
+  pendingDownloads: new Map(),
 };
 const videoMetadataCache = new WeakMap();
 const boxPicker = { file: null, frame: null, rect: null, start: null, objectUrl: null };
@@ -25,16 +26,16 @@ const qualityLabels = {
 };
 const qualityDimensions = {
   low: {
-    '16:9': [672, 384], '9:16': [384, 672], '1:1': [512, 512],
-    '4:3': [576, 448], '3:4': [448, 576], '21:9': [768, 320],
+    '16:9': [832, 480], '9:16': [480, 832], '1:1': [480, 480],
+    '4:3': [640, 480], '3:4': [480, 640], '21:9': [1104, 480],
   },
   standard: {
-    '16:9': [832, 480], '9:16': [480, 832], '1:1': [640, 640],
-    '4:3': [736, 544], '3:4': [544, 736], '21:9': [960, 416],
+    '16:9': [960, 544], '9:16': [544, 960], '1:1': [544, 544],
+    '4:3': [720, 544], '3:4': [544, 720], '21:9': [1248, 544],
   },
   high: {
-    '16:9': [1344, 768], '9:16': [768, 1344], '1:1': [1024, 1024],
-    '4:3': [1024, 768], '3:4': [768, 1024], '21:9': [1568, 672],
+    '16:9': [1280, 720], '9:16': [720, 1280], '1:1': [720, 720],
+    '4:3': [960, 720], '3:4': [720, 960], '21:9': [1680, 720],
   },
 };
 
@@ -81,9 +82,13 @@ function reportDraftError(error) {
 }
 
 function draftMeta() {
+  const form = $('#singleForm');
+  const settingNames = ['aspect_ratio', 'quality', 'seed', 'scheduler', 'sampler', 'steps', 'denoise'];
   return {
     id: 'single-task',
-    prompt: $('#singleForm')?.elements.prompt?.value || '',
+    prompt: form?.elements.prompt?.value || '',
+    settings: Object.fromEntries(settingNames.map((name) => [name, form?.elements[name]?.value || ''])),
+    generationSettingsOpen: Boolean($('.generation-settings')?.open),
     referenceRoles: Object.fromEntries(state.referenceRoles),
     productBoxes: Object.fromEntries(state.productBoxes),
   };
@@ -125,14 +130,6 @@ function persistDraftMeta() {
   saveDraftMeta().catch(reportDraftError);
 }
 
-async function clearSavedDraft() {
-  const database = await openDraftDatabase();
-  const transaction = database.transaction([DRAFT_FILES_STORE, DRAFT_META_STORE], 'readwrite');
-  transaction.objectStore(DRAFT_FILES_STORE).clear();
-  transaction.objectStore(DRAFT_META_STORE).clear();
-  await transactionFinished(transaction);
-}
-
 async function restoreSavedDraft() {
   const database = await openDraftDatabase();
   const transaction = database.transaction([DRAFT_FILES_STORE, DRAFT_META_STORE], 'readonly');
@@ -144,10 +141,15 @@ async function restoreSavedDraft() {
     ? item.file
     : new File([item.file], item.name, { type: item.type, lastModified: item.lastModified });
   state.selectedVideos = sortedRecords.filter((item) => item.kind === 'video').map(restoredFile).slice(0, 3);
-  state.selectedImages = sortedRecords.filter((item) => item.kind === 'image').map(restoredFile).slice(0, 9);
+  state.selectedImages = sortedRecords.filter((item) => item.kind === 'image').map(restoredFile).slice(0, 2);
   state.referenceRoles = new Map(Object.entries(meta?.referenceRoles || {}));
   state.productBoxes = new Map(Object.entries(meta?.productBoxes || {}));
-  $('#singleForm').elements.prompt.value = meta?.prompt || '';
+  const form = $('#singleForm');
+  form.elements.prompt.value = meta?.prompt || '';
+  for (const [name, value] of Object.entries(meta?.settings || {})) {
+    if (form.elements[name] && typeof value === 'string') form.elements[name].value = value;
+  }
+  $('.generation-settings').open = Boolean(meta?.generationSettingsOpen);
   syncFileInput($('#uploadVideos'), state.selectedVideos);
   syncFileInput($('#referenceImages'), state.selectedImages);
   renderMediaPreview(state.selectedVideos, $('#videoPreview'), 'video');
@@ -240,7 +242,7 @@ function formatMegabytes(value) {
 }
 
 function segmentCount(duration) {
-  return Math.max(1, Math.ceil(Number(duration || 0) / 15));
+  return Math.max(1, Math.ceil(Number(duration || 0) / 5));
 }
 
 function isVideo(file) {
@@ -307,6 +309,15 @@ function updateQualityResolution() {
   });
   const autoText = selectedRatio === 'auto' ? '（按每个上传视频的比例）' : '';
   hint.textContent = `预计输出尺寸：${sizes.join(' / ')} ${autoText}`.trim();
+}
+
+function updateSamplingAdvice() {
+  const steps = Number($('#singleForm').elements.steps.value);
+  const description = $('#generationSettingsDescription');
+  description.textContent = steps > 0 && steps < 30
+    ? `当前 ${steps} Steps 偏低；请改为至少 30，建议 50`
+    : '建议 50 Steps，以获得更稳定的替换效果';
+  description.classList.toggle('sampling-warning', steps > 0 && steps < 30);
 }
 
 function clearMediaPreview(container) {
@@ -393,11 +404,11 @@ function renderMediaPreview(files, container, kind) {
     if (isVideo(file)) {
       readVideoMetadata(file).then((metadata) => {
         meta.textContent = `${formatSeconds(metadata.duration)} 秒 · 原视频 ${metadata.width}×${metadata.height}`;
-        if (metadata.duration < 4) {
+        if (metadata.duration < 1) {
           meta.className = 'invalid';
-          meta.textContent += ' · 视频不能短于 4 秒';
-        } else if (metadata.duration > 15) {
-          meta.textContent += ` · 将自动切成 ${segmentCount(metadata.duration)} 段生成后合并`;
+          meta.textContent += ' · 视频不能短于 1 秒';
+        } else if (metadata.duration > 5) {
+          meta.textContent += ` · VACE 将自动切成 ${segmentCount(metadata.duration)} 段生成后合并`;
         }
         updateQualityResolution();
       }).catch((error) => {
@@ -536,32 +547,88 @@ $('#saveProductBox').addEventListener('click', () => {
   persistDraftMeta();
 });
 
-function renderTasks() {
-  const list = $('#taskList');
-  const counts = { queued: 0, running: 0, completed: 0, failed: 0 };
-  for (const task of state.tasks) {
-    if (task.status === 'queued') counts.queued += 1;
-    else if (['starting', 'running'].includes(task.status)) counts.running += 1;
-    else if (task.status === 'completed') counts.completed += 1;
-    else if (['failed', 'cancelled'].includes(task.status)) counts.failed += 1;
-  }
-  $('#queuedCount').textContent = counts.queued;
-  $('#runningCount').textContent = counts.running;
-  $('#completedCount').textContent = counts.completed;
-  $('#failedCount').textContent = counts.failed;
+function taskDetailHtml(task) {
+  const references = (task.reference_images || []).map((name, index) => {
+    const isProduct = task.reference_roles?.[index] === 'product'
+      || (!task.reference_roles?.length && task.product_image === name);
+    const role = isProduct ? '商品参考图' : '脸部参考图';
+    const url = task.reference_media_urls?.[index] || '';
+    return `<figure><img src="${escapeHtml(url)}" alt="${escapeHtml(role)}：${escapeHtml(name)}" loading="lazy"><figcaption>${escapeHtml(role)} · ${escapeHtml(name)}</figcaption></figure>`;
+  }).join('');
+  const parameters = [
+    ['画面比例', task.aspect_ratio === 'auto' ? '跟随原视频' : task.aspect_ratio],
+    ['视频清晰度', qualityLabels[task.quality] || task.quality || '低清'],
+    ['随机种子', String(task.seed ?? '')],
+    ['Scheduler / Sampler', `${task.scheduler || 'simple'} / ${task.sampler || 'uni_pc'}`],
+    ['Steps / Denoise', `${task.steps ?? 50} / ${task.denoise ?? 1}`],
+  ].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+  return `<div class="task-detail-content">
+    <div class="task-detail-section"><h3>上传视频</h3><div class="task-detail-media">
+      <figure><video src="${escapeHtml(task.source_media_url || '')}" controls preload="metadata"></video><figcaption>${escapeHtml(task.source_video)}</figcaption></figure>
+    </div></div>
+    <div class="task-detail-section"><h3>参考图片</h3>${references ? `<div class="task-detail-media">${references}</div>` : '<p>无参考图片</p>'}</div>
+    <div class="task-detail-section"><h3>提示词</h3><p>${escapeHtml(task.prompt || '未填写提示词')}</p></div>
+    <div class="task-detail-section"><h3>生成参数</h3><dl class="task-detail-params">${parameters}</dl></div>
+  </div>`;
+}
 
-  if (!state.tasks.length) {
-    list.innerHTML = '<div class="empty">还没有任务</div>';
-    return;
-  }
-  list.innerHTML = state.tasks.map((task) => {
+function openTaskDetail(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) return;
+  $('#taskDetailContent').innerHTML = taskDetailHtml(task);
+  $('#taskDetailDialog').showModal();
+}
+
+function updateDownloadButtons() {
+  document.querySelectorAll('[data-download]').forEach((button) => {
+    const until = state.pendingDownloads.get(button.dataset.download);
+    const seconds = until ? Math.max(1, Math.ceil((until - Date.now()) / 1000)) : 0;
+    button.disabled = Boolean(until);
+    button.textContent = until ? `已开始下载 · ${seconds} 秒` : '下载成片';
+  });
+}
+
+function startDownload(taskId) {
+  if (state.pendingDownloads.has(taskId)) return;
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task?.download_url) return;
+  state.pendingDownloads.set(taskId, Date.now() + 3000);
+  updateDownloadButtons();
+  const link = document.createElement('a');
+  link.href = task.download_url;
+  link.download = `${task.name || '成片'}.mp4`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => {
+    state.pendingDownloads.delete(taskId);
+    updateDownloadButtons();
+  }, 3000);
+}
+
+const RECENT_TASK_DAYS = 3;
+
+function isRecentQueueTask(task) {
+  if (['queued', 'starting', 'running'].includes(task.status)) return true;
+  const created = new Date(task.created_at).getTime();
+  return Number.isFinite(created) && created >= Date.now() - RECENT_TASK_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function matchesTaskStatus(task, status) {
+  if (status === 'all') return true;
+  if (status === 'running') return ['starting', 'running'].includes(task.status);
+  return task.status === status;
+}
+
+function taskCardsHtml(tasks) {
+  return tasks.map((task) => {
     const status = statusLabels[task.status] || task.status;
     const queue = task.queue_position ? `<span>队列第 ${task.queue_position} 位</span>` : '';
     const error = task.error ? `<p class="task-error">${escapeHtml(task.error)}</p>` : '';
     const download = task.download_url
-      ? `<a href="${task.download_url}" data-download="${task.id}">下载成片</a>` : '';
+      ? `<button type="button" data-download="${escapeHtml(task.id)}">下载成片</button>` : '';
     const retry = ['failed', 'cancelled'].includes(task.status)
-      ? `<button data-retry="${task.id}">重试</button>` : '';
+      ? `<button data-retry="${escapeHtml(task.id)}">重试</button>` : '';
     const progressValue = Math.max(0, Math.min(100, Number(task.progress || 0)));
     const stage = task.stage || (task.status === 'queued' ? '等待队列' : status);
     const segments = Number(task.segment_count || 1) > 1
@@ -572,8 +639,8 @@ function renderTasks() {
     const resolution = task.output_width && task.output_height
       ? `${task.output_width}×${task.output_height}`
       : (task.precision_mode ? '跟随原视频' : (presetSize ? `${presetSize[0]}×${presetSize[1]}` : '等待计算尺寸'));
-    const mode = task.precision_mode ? '精准局部替换' : 'H3 整段复刻';
-    const generation = `${task.scheduler || 'simple'} / ${task.sampler || 'res_multistep'} · ${Number(task.steps || 20)} Steps · Denoise ${Number(task.denoise ?? 1).toFixed(2)}`;
+    const mode = '精准局部替换';
+    const generation = `${task.scheduler || 'simple'} / ${task.sampler || 'uni_pc'} · ${Number(task.steps || 50)} Steps · Denoise ${Number(task.denoise ?? 1).toFixed(2)}`;
     const elapsed = task.started_at
       ? `<span class="task-elapsed" data-elapsed-start="${escapeHtml(task.started_at)}" data-elapsed-finish="${escapeHtml(task.finished_at || '')}">${escapeHtml(elapsedLabel(task.started_at, task.finished_at || ''))}</span>`
       : '';
@@ -592,9 +659,46 @@ function renderTasks() {
         <div class="task-stage"><span>${escapeHtml(stage)}</span><strong>${progressValue}%</strong></div>
         <div class="progress"><div style="width:${progressValue}%"></div></div>
       </div>
-      <div class="task-actions">${download}${retry}<button class="delete" data-delete="${task.id}">删除</button></div>
+      <div class="task-actions"><button type="button" class="details" data-details="${escapeHtml(task.id)}">详情</button>${download}${retry}<button class="delete" data-delete="${escapeHtml(task.id)}">删除</button></div>
     </article>`;
   }).join('');
+}
+
+function renderTaskCollection(list, tasks, emptyText) {
+  const scrollTop = list.scrollTop;
+  list.innerHTML = tasks.length ? taskCardsHtml(tasks) : `<div class="empty">${emptyText}</div>`;
+  list.scrollTop = scrollTop;
+  updateDownloadButtons();
+}
+
+function renderHistoryTasks() {
+  const status = $('#historyStatusFilter').value;
+  const tasks = state.tasks.filter((task) => matchesTaskStatus(task, status));
+  $('#historySummary').textContent = `全部 ${state.tasks.length} 个任务，当前显示 ${tasks.length} 个`;
+  renderTaskCollection($('#historyTaskList'), tasks, '没有符合条件的历史任务');
+}
+
+function renderTasks() {
+  const counts = { queued: 0, running: 0, completed: 0, failed: 0 };
+  for (const task of state.tasks) {
+    if (task.status === 'queued') counts.queued += 1;
+    else if (['starting', 'running'].includes(task.status)) counts.running += 1;
+    else if (task.status === 'completed') counts.completed += 1;
+    else if (['failed', 'cancelled'].includes(task.status)) counts.failed += 1;
+  }
+  $('#queuedCount').textContent = counts.queued;
+  $('#runningCount').textContent = counts.running;
+  $('#completedCount').textContent = counts.completed;
+  $('#failedCount').textContent = counts.failed;
+
+  const recentTasks = state.tasks.filter(isRecentQueueTask);
+  const visibleTasks = recentTasks.filter((task) => matchesTaskStatus(task, $('#queueStatusFilter').value));
+  const olderCount = state.tasks.length - recentTasks.length;
+  $('#queueSummary').textContent = `最近 ${RECENT_TASK_DAYS} 天及未结束任务 · ${recentTasks.length} 个`;
+  $('#openHistoryButton').textContent = olderCount ? `查看更多历史（${olderCount}）` : '查看更多历史';
+  renderTaskCollection($('#taskList'), visibleTasks,
+    state.tasks.length ? '最近 3 天没有符合条件的任务，可查看历史' : '还没有任务');
+  if ($('#historyDialog').open) renderHistoryTasks();
 }
 
 function setMeter(id, value) {
@@ -652,10 +756,14 @@ async function loadHealth() {
   try {
     const response = await fetch('/health');
     const data = await response.json();
-    if (data.engine === 'ok') {
+    if (data.engine === 'ok' && data.vace_node !== false) {
       element.className = 'health ok';
-      element.querySelector('b').textContent = 'ComfyUI 正常';
-      element.title = `已连接 ${data.engine_url || 'ComfyUI'}`;
+      element.querySelector('b').textContent = 'VACE 引擎正常';
+      element.title = `已连接 ${data.engine_url || 'ComfyUI'}，WanVaceToVideo 可用`;
+    } else if (data.engine === 'ok') {
+      element.className = 'health bad';
+      element.querySelector('b').textContent = 'ComfyUI 缺少 VACE';
+      element.title = '当前 ComfyUI 没有 WanVaceToVideo 节点，请按 README 更新部署';
     } else {
       element.className = 'health bad';
       element.querySelector('b').textContent = 'ComfyUI 未连接（6008）';
@@ -679,7 +787,7 @@ $('#uploadVideos').addEventListener('change', (event) => {
   appendSelectedFiles('video', event.currentTarget, [...event.currentTarget.files], 3, $('#videoPreview'));
 });
 $('#referenceImages').addEventListener('change', (event) => {
-  appendSelectedFiles('image', event.currentTarget, [...event.currentTarget.files], 9, $('#imagePreview'));
+  appendSelectedFiles('image', event.currentTarget, [...event.currentTarget.files], 2, $('#imagePreview'));
 });
 $('#singleForm').elements.prompt.addEventListener('input', () => {
   clearTimeout(promptSaveTimer);
@@ -689,14 +797,20 @@ $('#singleForm').elements.prompt.addEventListener('change', persistDraftMeta);
 $('#clearDraftButton').addEventListener('click', async () => {
   clearComposer();
   try {
-    await clearSavedDraft();
+    await Promise.all([saveDraftFiles(), saveDraftMeta()]);
     toast('已清空上传的视频、图片和提示词');
   } catch (error) {
     reportDraftError(error);
   }
 });
+document.querySelectorAll('.generation-settings input, .generation-settings select').forEach((field) => {
+  field.addEventListener('input', persistDraftMeta);
+  field.addEventListener('change', persistDraftMeta);
+});
+$('.generation-settings').addEventListener('toggle', persistDraftMeta);
 $('#singleForm').elements.aspect_ratio.addEventListener('change', updateQualityResolution);
 $('#singleForm').elements.quality.addEventListener('change', updateQualityResolution);
+$('#singleForm').elements.steps.addEventListener('input', updateSamplingAdvice);
 
 $('#singleForm').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -705,15 +819,25 @@ $('#singleForm').addEventListener('submit', async (event) => {
   button.disabled = true;
   button.textContent = '正在上传…';
   try {
+    const steps = Number(form.elements.steps.value);
+    if (steps < 30) {
+      $('.generation-settings').open = true;
+      form.elements.steps.focus();
+      throw new Error('当前 VACE 模型至少需要 30 Steps，建议改为 50 后再提交');
+    }
     const videos = state.selectedVideos;
     if (!videos.length) throw new Error('请至少上传一个视频');
     if (videos.length > 3) throw new Error('上传视频最多选择 3 个');
-    if (state.selectedImages.length > 9) throw new Error('参考图片最多上传 9 张');
+    if (!state.selectedImages.length) throw new Error('请至少上传一张脸部参考图或商品参考图');
+    if (state.selectedImages.length > 2) throw new Error('参考图片最多上传 2 张');
     const referenceRoles = state.selectedImages.map((file) => state.referenceRoles.get(fileKey(file)) || 'face');
+    if (referenceRoles.filter((role) => role === 'face').length > 1 || referenceRoles.filter((role) => role === 'product').length > 1) {
+      throw new Error('脸部参考图和商品参考图各最多 1 张');
+    }
     const durations = await Promise.all(videos.map(readVideoDuration));
-    const invalidIndex = durations.findIndex((duration) => duration < 4);
+    const invalidIndex = durations.findIndex((duration) => duration < 1);
     if (invalidIndex >= 0) {
-      throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；视频不能短于 4 秒`);
+      throw new Error(`${videos[invalidIndex].name} 为 ${formatSeconds(durations[invalidIndex])} 秒；视频不能短于 1 秒`);
     }
     const body = new FormData(form);
     if (!body.get('seed')) body.delete('seed');
@@ -722,16 +846,13 @@ $('#singleForm').addEventListener('submit', async (event) => {
     body.append('product_boxes', JSON.stringify(videos.map((file) => state.productBoxes.get(fileKey(file)) || null)));
     body.append('precision_mode', 'true');
     const data = await api('/api/tasks', { method: 'POST', body });
-    form.reset();
-    clearComposer();
-    await clearSavedDraft();
-    toast(`已加入 ${data.created} 个复刻任务`);
+    toast(`已加入 ${data.created} 个精准替换任务`);
     await loadTasks();
   } catch (error) {
     toast(error.message);
   } finally {
     button.disabled = false;
-    button.textContent = '批量加入复刻队列';
+    button.textContent = '批量加入精准替换队列';
   }
 });
 
@@ -759,9 +880,19 @@ $('#excelForm').addEventListener('submit', async (event) => {
   }
 });
 
-$('#taskList').addEventListener('click', async (event) => {
+async function handleTaskActionClick(event) {
+  const detailsButton = event.target.closest('[data-details]');
+  const downloadButton = event.target.closest('[data-download]');
   const deleteButton = event.target.closest('[data-delete]');
   const retryButton = event.target.closest('[data-retry]');
+  if (detailsButton) {
+    openTaskDetail(detailsButton.dataset.details);
+    return;
+  }
+  if (downloadButton) {
+    startDownload(downloadButton.dataset.download);
+    return;
+  }
   if (deleteButton) {
     if (!confirm('确定删除这个任务吗？生成中的任务会同时请求取消。')) return;
     try {
@@ -777,20 +908,45 @@ $('#taskList').addEventListener('click', async (event) => {
       await loadTasks();
     } catch (error) { toast(error.message); }
   }
+}
+
+$('#taskList').addEventListener('click', handleTaskActionClick);
+$('#historyTaskList').addEventListener('click', handleTaskActionClick);
+$('#queueStatusFilter').addEventListener('change', renderTasks);
+$('#historyStatusFilter').addEventListener('change', renderHistoryTasks);
+$('#openHistoryButton').addEventListener('click', () => {
+  renderHistoryTasks();
+  $('#historyDialog').showModal();
 });
+$('#closeHistoryButton').addEventListener('click', () => $('#historyDialog').close());
+
+$('#closeTaskDetail').addEventListener('click', () => $('#taskDetailDialog').close());
+$('#taskDetailDialog').addEventListener('close', () => { $('#taskDetailContent').innerHTML = ''; });
 
 $('#refreshButton').addEventListener('click', () => { loadTasks(); loadHealth(); });
 
+function syncQueuePanelHeight() {
+  const height = Math.ceil($('.create-panel').getBoundingClientRect().height);
+  if (height > 0) $('.queue-panel').style.setProperty('--create-panel-height', `${height}px`);
+}
+
+if ('ResizeObserver' in window) {
+  new ResizeObserver(syncQueuePanelHeight).observe($('.create-panel'));
+}
+window.addEventListener('resize', syncQueuePanelHeight);
+
 (async function init() {
+  syncQueuePanelHeight();
   try {
     await restoreSavedDraft();
   } catch (error) {
     reportDraftError(error);
   }
   updateQualityResolution();
+  updateSamplingAdvice();
   await Promise.all([loadTasks(true), loadHealth(), loadSystemStatus()]);
   setInterval(() => loadTasks(true), 3000);
-  setInterval(updateElapsedTimes, 1000);
+  setInterval(() => { updateElapsedTimes(); updateDownloadButtons(); }, 1000);
   setInterval(loadSystemStatus, 3000);
   setInterval(loadHealth, 15000);
 })();
